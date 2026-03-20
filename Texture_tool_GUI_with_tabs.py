@@ -1396,8 +1396,10 @@ class MainWindow(QMainWindow):
             self._do_update(info["download_url"])
 
     def _do_update(self, download_url: str):
-        """执行下载和更新流程，带进度条"""
-        progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        """执行下载和更新流程，带完整进度条（下载 0~50%，应用更新 50~100%）"""
+        import threading
+
+        progress = QProgressDialog("准备更新...", "取消", 0, 100, self)
         progress.setWindowTitle("更新中")
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
@@ -1406,66 +1408,119 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
-        self._cancelled = False
+        # 用 threading.Event 作为取消信号，后台线程会检查它
+        self._stop_event = threading.Event()
 
         def on_cancel():
-            self._cancelled = True
+            self._stop_event.set()
         progress.canceled.connect(on_cancel)
 
-        class _DownloadThread(QThread):
-            progress_update = Signal(int)
-            finished_ok = Signal(str)     # zip_path
-            finished_err = Signal(str)    # error message
+        # ── 后台线程：负责下载 + 应用更新 ──
+        class _UpdateWorkerThread(QThread):
+            # 下载进度信号 (percent 0-100, 仅下载部分)
+            download_progress = Signal(int)
+            # 应用更新进度信号 (percent 0-100, stage 描述)
+            apply_progress = Signal(int, str)
+            # 下载完成信号
+            download_done = Signal()
+            # 全部完成信号，携带新版本 exe 路径
+            finished_ok = Signal(str)
+            # 失败信号
+            finished_err = Signal(str)
+            # 用户取消信号
+            cancelled = Signal()
 
-            def __init__(self_t, url):
+            def __init__(self_t, url, stop_event):
                 super().__init__()
                 self_t.url = url
+                self_t.stop_event = stop_event
 
             def run(self_t):
                 try:
-                    from updater import download_update
-                    zip_path = download_update(
-                        self_t.url,
-                        progress_callback=self_t.progress_update.emit
+                    # 阶段一：下载（支持取消中断）
+                    from updater import download_update, UpdateCancelledError
+                    try:
+                        zip_path = download_update(
+                            self_t.url,
+                            progress_callback=self_t.download_progress.emit,
+                            stop_event=self_t.stop_event,
+                        )
+                    except UpdateCancelledError:
+                        self_t.cancelled.emit()
+                        return
+
+                    self_t.download_done.emit()
+
+                    # 阶段二：应用更新（解压、备份、安装——不可取消）
+                    from updater import apply_update
+                    result = apply_update(
+                        zip_path,
+                        progress_callback=self_t.apply_progress.emit
                     )
-                    self_t.finished_ok.emit(zip_path)
+                    if result and isinstance(result, str):
+                        # result 是新版本 exe 的路径
+                        self_t.finished_ok.emit(result)
+                    else:
+                        self_t.finished_err.emit("应用更新失败")
                 except Exception as e:
                     self_t.finished_err.emit(str(e))
 
-        def on_progress(percent):
-            if not self._cancelled:
-                progress.setValue(percent)
+        def on_download_progress(percent):
+            """下载阶段：映射到总进度 0% ~ 50%"""
+            if not self._stop_event.is_set():
+                total_pct = int(percent * 0.5)
+                progress.setValue(total_pct)
                 progress.setLabelText(f"正在下载更新... {percent}%")
                 QApplication.processEvents()
 
-        def on_download_ok(zip_path):
-            progress.setValue(100)
-            progress.setLabelText("下载完成，正在应用更新...")
+        def on_download_done():
+            """下载完成，切换到应用更新阶段"""
+            if not self._stop_event.is_set():
+                progress.setValue(50)
+                progress.setLabelText("下载完成，准备安装...")
+                # 下载完成后禁用取消按钮（应用更新不可中断）
+                progress.setCancelButton(None)
+                QApplication.processEvents()
+
+        def on_apply_progress(percent, stage):
+            """应用更新阶段：映射到总进度 50% ~ 100%"""
+            total_pct = 50 + int(percent * 0.5)
+            progress.setValue(total_pct)
+            progress.setLabelText(stage)
             QApplication.processEvents()
 
-            from updater import apply_update
-            success = apply_update(zip_path)
-            if not success:
-                progress.close()
+        def on_finished_ok(new_exe_path):
+            """更新完成，在主线程中启动新版本并退出"""
+            progress.setValue(100)
+            progress.setLabelText("更新完成，正在重启...")
+            QApplication.processEvents()
+            # 在主线程中安全地启动新版本并退出
+            import subprocess
+            from updater import get_app_dir
+            subprocess.Popen([new_exe_path], cwd=get_app_dir())
+            QApplication.quit()
+
+        def on_finished_err(err_msg):
+            progress.close()
+            if not self._stop_event.is_set():
                 QMessageBox.warning(
                     self, "更新失败",
-                    "应用更新时出错，程序将继续使用当前版本。\n"
+                    f"更新时出错：\n{err_msg}\n\n"
+                    "程序将继续使用当前版本。\n"
                     "你可以稍后手动从 GitHub Release 页面下载最新版本。"
                 )
 
-        def on_download_err(err_msg):
+        def on_cancelled():
+            """用户取消了下载，关闭进度条"""
             progress.close()
-            if not self._cancelled:
-                QMessageBox.warning(
-                    self, "下载失败",
-                    f"下载更新时出错：\n{err_msg}\n\n"
-                    "请检查网络连接，或稍后手动从 GitHub Release 页面下载。"
-                )
 
-        self._dl_thread = _DownloadThread(download_url)
-        self._dl_thread.progress_update.connect(on_progress)
-        self._dl_thread.finished_ok.connect(on_download_ok)
-        self._dl_thread.finished_err.connect(on_download_err)
+        self._dl_thread = _UpdateWorkerThread(download_url, self._stop_event)
+        self._dl_thread.download_progress.connect(on_download_progress)
+        self._dl_thread.download_done.connect(on_download_done)
+        self._dl_thread.apply_progress.connect(on_apply_progress)
+        self._dl_thread.finished_ok.connect(on_finished_ok)
+        self._dl_thread.finished_err.connect(on_finished_err)
+        self._dl_thread.cancelled.connect(on_cancelled)
         self._dl_thread.start()
 
     # ---------------- UI enable ----------------

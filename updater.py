@@ -118,41 +118,59 @@ def check_for_update() -> dict | None:
 
 
 # ── 下载并应用更新 ────────────────────────────────────────────────
-def download_update(download_url: str, progress_callback=None) -> str:
+class UpdateCancelledError(Exception):
+    """用户取消更新时抛出的异常"""
+    pass
+
+
+def download_update(download_url: str, progress_callback=None, stop_event=None) -> str:
     """
     下载 zip 文件到临时目录。
     
     参数:
         download_url: zip 的下载链接
         progress_callback: 可选，回调函数 callback(percent: int)，percent 范围 0-100
+        stop_event: 可选，threading.Event 对象，set() 后中断下载
     
     返回值:
         下载好的 zip 文件完整路径
     
     异常:
         下载失败时抛出异常，由调用方处理。
+        用户取消时抛出 UpdateCancelledError。
     """
     tmp_dir = tempfile.mkdtemp(prefix="ppeditor_update_")
     zip_path = os.path.join(tmp_dir, "update.zip")
 
-    req = Request(download_url, headers={"User-Agent": "PPEditor-Updater"})
-    with urlopen(req, timeout=300) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        with open(zip_path, "wb") as f:
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    progress_callback(int(downloaded * 100 / total))
+    try:
+        req = Request(download_url, headers={"User-Agent": "PPEditor-Updater"})
+        with urlopen(req, timeout=300) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            with open(zip_path, "wb") as f:
+                while True:
+                    # 检查是否被取消
+                    if stop_event and stop_event.is_set():
+                        raise UpdateCancelledError("用户取消了下载")
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        progress_callback(int(downloaded * 100 / total))
+    except UpdateCancelledError:
+        # 取消时清理不完整的临时文件
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
 
     return zip_path
 
 
-def apply_update(zip_path: str) -> bool:
+def apply_update(zip_path: str, progress_callback=None) -> bool:
     """
     解压 zip 并替换当前程序目录，然后重启。
     
@@ -163,10 +181,19 @@ def apply_update(zip_path: str) -> bool:
     4. 退出当前进程
     5. 下次启动时 launcher.py 负责清理 _old_version_backup/
     
+    参数:
+        zip_path: 下载好的 zip 文件路径
+        progress_callback: 可选，回调函数 callback(percent: int, stage: str)
+                          percent 范围 0-100，stage 为当前阶段描述
+    
     返回值:
         成功启动新版本后不会返回（进程已退出）。
         失败时返回 False 并尝试回滚。
     """
+    def _progress(percent, stage):
+        if progress_callback:
+            progress_callback(percent, stage)
+
     if not getattr(sys, "frozen", False):
         # 开发环境下不执行自更新
         return False
@@ -177,8 +204,15 @@ def apply_update(zip_path: str) -> bool:
 
     try:
         # ① 解压 zip 到临时目录
+        _progress(5, "正在解压更新包...")
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+            members = zf.namelist()
+            total_members = len(members)
+            for i, member in enumerate(members):
+                zf.extract(member, extract_dir)
+                # 解压阶段占 5% ~ 35%
+                pct = 5 + int((i + 1) / total_members * 30)
+                _progress(pct, f"正在解压更新包... ({i+1}/{total_members})")
 
         # zip 内可能有一层根目录，也可能直接是文件
         # 检测：如果解压后只有一个子目录，就进入那个子目录
@@ -189,6 +223,7 @@ def apply_update(zip_path: str) -> bool:
                 extract_dir = single
 
         # ② 备份当前目录中的文件（排除备份目录本身和临时文件）
+        _progress(36, "正在备份旧版本...")
         if os.path.exists(backup_dir):
             shutil.rmtree(backup_dir, ignore_errors=True)
         os.makedirs(backup_dir, exist_ok=True)
@@ -201,23 +236,28 @@ def apply_update(zip_path: str) -> bool:
             "__pycache__",
         }
 
-        for item in os.listdir(app_dir):
-            if item in _skip:
-                continue
+        backup_items = [item for item in os.listdir(app_dir) if item not in _skip]
+        total_backup = len(backup_items) if backup_items else 1
+        for i, item in enumerate(backup_items):
             src = os.path.join(app_dir, item)
             dst = os.path.join(backup_dir, item)
             try:
                 if os.path.isdir(src):
                     shutil.move(src, dst)
                 else:
-                    # exe 自身可能被锁定，跳过移动失败的情况
                     shutil.move(src, dst)
             except PermissionError:
                 # 当前正在运行的 exe 可能无法移动，跳过
                 pass
+            # 备份阶段占 36% ~ 60%
+            pct = 36 + int((i + 1) / total_backup * 24)
+            _progress(pct, f"正在备份旧版本... ({i+1}/{total_backup})")
 
         # ③ 将新版本文件复制到应用目录
-        for item in os.listdir(extract_dir):
+        _progress(61, "正在安装新版本...")
+        new_items = os.listdir(extract_dir)
+        total_new = len(new_items) if new_items else 1
+        for i, item in enumerate(new_items):
             src = os.path.join(extract_dir, item)
             dst = os.path.join(app_dir, item)
             if os.path.isdir(src):
@@ -226,25 +266,28 @@ def apply_update(zip_path: str) -> bool:
                 shutil.copytree(src, dst)
             else:
                 shutil.copy2(src, dst)
+            # 安装阶段占 61% ~ 90%
+            pct = 61 + int((i + 1) / total_new * 29)
+            _progress(pct, f"正在安装新版本... ({i+1}/{total_new})")
 
-        # ④ 启动新版本
+        # ④ 查找新版本 exe 路径（不再在子线程中启动/退出，交给主线程）
+        _progress(95, "正在准备重启...")
         new_exe = os.path.join(app_dir, os.path.basename(sys.executable))
         if os.path.exists(new_exe):
-            subprocess.Popen([new_exe], cwd=app_dir)
-            sys.exit(0)
+            _progress(100, "更新完成，即将重启...")
+            return new_exe  # 返回 exe 路径，由主线程启动并退出
         else:
             # 如果 exe 名变了，尝试找任意 .exe
             for f in os.listdir(app_dir):
                 if f.lower().endswith(".exe") and not f.startswith("_"):
-                    subprocess.Popen(
-                        [os.path.join(app_dir, f)], cwd=app_dir
-                    )
-                    sys.exit(0)
+                    _progress(100, "更新完成，即将重启...")
+                    return os.path.join(app_dir, f)
 
         return False  # 没找到 exe，不重启
 
     except Exception:
         # ⑤ 回滚：尝试把备份的文件还原
+        _progress(0, "更新失败，正在回滚...")
         try:
             if os.path.exists(backup_dir):
                 for item in os.listdir(backup_dir):
