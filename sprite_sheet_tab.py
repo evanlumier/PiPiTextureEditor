@@ -1003,6 +1003,10 @@ class SpriteSheetTab(QWidget):
         self.btn_reset_grid.clicked.connect(self._reset_grid_to_auto)
 
         self.btn_export = QPushButton("导出精灵图（PNG）")
+        self.btn_export.setStyleSheet(
+            "background:#89b4fa; color:#1e1e2e; font-weight:700;"
+            "padding:8px; border-radius:7px;"
+        )
         self.btn_export.clicked.connect(self.export_sheet)
 
         grp_lay.addWidget(self.btn_add)
@@ -1021,8 +1025,6 @@ class SpriteSheetTab(QWidget):
         grp_lay.addWidget(self.chk_auto_grid)
         grp_lay.addLayout(rc_row)
         grp_lay.addWidget(self.btn_reset_grid)
-        grp_lay.addSpacing(10)
-        grp_lay.addWidget(self.btn_export)
 
         right_col.addWidget(grp)
         # -------- 一键命名（精灵图，带记忆） --------
@@ -1058,6 +1060,8 @@ class SpriteSheetTab(QWidget):
         name_lay.addWidget(self.btn_reset_name)
 
         right_col.addWidget(name_box)
+
+        right_col.addWidget(self.btn_export)
 
         right_col.addStretch(1)
 

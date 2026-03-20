@@ -101,7 +101,7 @@ class CropCanvas(QLabel):
     def __init__(self, pil_img: Image.Image):
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#0d0d1a;border-radius:10px;")
+        self.setStyleSheet("background:#2a2a38;border-radius:10px;")
         self.setMouseTracking(True)
 
         self.pil_img = pil_img.convert("RGBA")
@@ -276,14 +276,31 @@ class CropCanvas(QLabel):
             self.update()
 
     def paintEvent(self, e):
-        super().paintEvent(e)
+        # 先绘制框内底色（在图片下方，不会遮挡图片）
+        if self._pix_rect:
+            p0 = QPainter(self)
+            p0.setPen(Qt.NoPen)
+            p0.setBrush(QColor(58, 58, 74))  # #3a3a4a — 框内较亮底色
+            p0.drawRect(self._pix_rect)
+            p0.end()
 
-        if not self.sel_rect:
-            return
+        # QLabel 绘制图片（在底色之上）
+        super().paintEvent(e)
 
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
+        # 图片边缘指引线（比框内底色再亮一档）
+        if self._pix_rect:
+            border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a
+            border_pen.setWidth(1)
+            p.setPen(border_pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(self._pix_rect)
+
+        if not self.sel_rect:
+            p.end()
+            return
         from PySide6.QtGui import QPainterPath
 
         path = QPainterPath()
@@ -305,6 +322,15 @@ class CropCanvas(QLabel):
             p.fillRect(hr, QColor(255, 255, 255, 230))
 
         p.end()
+
+    def rotate_image(self, clockwise: bool = True):
+        """旋转图片90度，clockwise=True顺时针，False逆时针。"""
+        angle = -90 if clockwise else 90
+        self.pil_img = self.pil_img.rotate(angle, expand=True)
+        self.img_w, self.img_h = self.pil_img.size
+        # 清除裁切选区
+        self.sel_rect = None
+        self._render()
 
     def get_cropped_image(self) -> Optional[Image.Image]:
         if not self.sel_rect or not self._pix_rect or not self._pixmap_scaled:
@@ -445,7 +471,7 @@ class CropDialog(QDialog):
 
     def __init__(self, pil_img: Image.Image, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Crop / 裁切")
+        self.setWindowTitle("裁切/旋转")
         self.resize(980, 720)
         self.setStyleSheet("""
             QDialog { background-color: #1e1e2e; color: #cdd6f4; }
@@ -460,7 +486,7 @@ class CropDialog(QDialog):
         """)
 
         self.canvas = CropCanvas(pil_img)
-        self.canvas.setMinimumSize(860, 560)
+        self.canvas.setMinimumSize(810, 560)
 
         tips = QLabel("拖拽创建裁切框；框内拖动移动；拖动角点缩放；确定后应用。")
         tips.setWordWrap(True)
@@ -469,9 +495,49 @@ class CropDialog(QDialog):
         btns.accepted.connect(self._on_ok)
         btns.rejected.connect(self.reject)
 
+        # ---- 左侧工具栏 ----
+        toolbar = QWidget()
+        toolbar.setFixedWidth(42)
+        toolbar.setStyleSheet("background: #252536; border-radius: 8px;")
+        tb_layout = QVBoxLayout(toolbar)
+        tb_layout.setContentsMargins(4, 8, 4, 8)
+        tb_layout.setSpacing(6)
+
+        btn_ccw = QPushButton("↺")
+        btn_ccw.setToolTip("逆时针旋转 90°")
+        btn_ccw.setFixedSize(34, 34)
+        btn_ccw.setStyleSheet("""
+            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
+                          background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
+            QPushButton:hover { background: #45475a; border-color: #89b4fa; }
+            QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
+        """)
+        btn_ccw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=False))
+
+        btn_cw = QPushButton("↻")
+        btn_cw.setToolTip("顺时针旋转 90°")
+        btn_cw.setFixedSize(34, 34)
+        btn_cw.setStyleSheet("""
+            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
+                          background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
+            QPushButton:hover { background: #45475a; border-color: #89b4fa; }
+            QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
+        """)
+        btn_cw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=True))
+
+        tb_layout.addWidget(btn_ccw)
+        tb_layout.addWidget(btn_cw)
+        tb_layout.addStretch()
+
+        # ---- 中间区域（工具栏 + 画布）水平排列 ----
+        center_layout = QHBoxLayout()
+        center_layout.setSpacing(6)
+        center_layout.addWidget(toolbar)
+        center_layout.addWidget(self.canvas, 1)
+
         layout = QVBoxLayout(self)
         layout.addWidget(tips)
-        layout.addWidget(self.canvas, 1)
+        layout.addLayout(center_layout, 1)
         layout.addWidget(btns)
 
         self.result_img: Optional[Image.Image] = None
@@ -523,12 +589,38 @@ class DropLabel(QLabel):
 
 
 class CheckerLabel(QLabel):
-    """带棋盘格透明背景的预览Label"""
+    """带棋盘格透明背景的预览Label，hover时显示图片边界线"""
     def __init__(self, cell=12, color1=None, color2=None, parent=None):
         super().__init__(parent)
         self.cell = cell
         self.color1 = color1 or QColor(42, 42, 58)
         self.color2 = color2 or QColor(30, 30, 46)
+        self._hovered = False
+        self.setMouseTracking(True)
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def _pixmap_rect(self):
+        """计算当前pixmap在label中居中显示的实际矩形区域"""
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        # label的内容区域（去除margin/border）
+        cr = self.contentsRect()
+        # pixmap实际尺寸
+        pw, ph = pm.width(), pm.height()
+        # 居中偏移
+        x = cr.x() + (cr.width() - pw) // 2
+        y = cr.y() + (cr.height() - ph) // 2
+        return QRect(x, y, pw, ph)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -541,6 +633,19 @@ class CheckerLabel(QLabel):
                 painter.fillRect(c * cell, r * cell, cell, cell, color)
         painter.end()
         super().paintEvent(event)
+
+        # hover时绘制图片边界指引线
+        if self._hovered:
+            pix_rect = self._pixmap_rect()
+            if pix_rect:
+                p = QPainter(self)
+                p.setRenderHint(QPainter.Antialiasing, False)
+                border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a — 与crop一致的边界线颜色
+                border_pen.setWidth(1)
+                p.setPen(border_pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(pix_rect)
+                p.end()
 
 
 # =========================
@@ -1002,7 +1107,7 @@ class MainWindow(QMainWindow):
 
         # 裁切 + 重置（80%/20%）
         crop_row = QHBoxLayout()
-        btn_crop = QPushButton("Crop/裁切（PS样式）")
+        btn_crop = QPushButton("裁切/旋转")
         btn_crop.setStyleSheet("text-align:center;")
         btn_crop.setMinimumWidth(340)
         btn_crop.clicked.connect(self.open_crop_dialog)
@@ -1204,6 +1309,10 @@ class MainWindow(QMainWindow):
         self.chk_overwrite.setChecked(False)
 
         self.btn_export = QPushButton("导出")
+        self.btn_export.setStyleSheet(
+            "background:#89b4fa; color:#1e1e2e; font-weight:700;"
+            "padding:8px; border-radius:7px;"
+        )
         self.btn_export.clicked.connect(self.export_image)
 
         export_layout.addWidget(QLabel("格式："))
