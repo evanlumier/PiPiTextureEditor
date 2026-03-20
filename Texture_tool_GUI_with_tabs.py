@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageEnhance, ImageOps
 
-from PySide6.QtCore import Qt, QRect, QPoint, QRegularExpression, QSize
+from PySide6.QtCore import Qt, QRect, QPoint, QRegularExpression, QSize, QThread, Signal
 from PySide6.QtGui import (
     QPixmap,
     QImage,
@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QTabBar,
     QStyleOptionTab,
     QStyle,
+    QProgressDialog,
 )
 
 
@@ -54,6 +55,7 @@ from sprite_sheet_tab import SpriteSheetTab
 from flowmap_tab import FlowMapTab
 from growth_gray_tab import GrowthGrayTab
 from image_viewer_tab import ImageViewerTab
+from version import __version__
 
 # =========================
 # 规则：输入框仅允许 A-Z a-z 0-9 _ （导出名由输入框保证）
@@ -1347,6 +1349,121 @@ class MainWindow(QMainWindow):
         # 启动参数自动导入
         if initial_path:
             self.load_image(initial_path)
+
+        # ── 后台检查更新 ──
+        self._start_update_checker()
+
+    # ---------------- 在线更新 ----------------
+    def _start_update_checker(self):
+        """在后台线程中检查 GitHub Release 是否有新版本"""
+        class _UpdateThread(QThread):
+            update_found = Signal(dict)
+            def run(self_t):
+                try:
+                    from updater import check_for_update
+                    result = check_for_update()
+                    if result:
+                        self_t.update_found.emit(result)
+                except Exception:
+                    pass  # 静默失败
+
+        self._update_thread = _UpdateThread(self)
+        self._update_thread.update_found.connect(self._on_update_found)
+        self._update_thread.start()
+
+    def _on_update_found(self, info: dict):
+        """收到新版本信息后弹窗提示用户"""
+        changelog = info.get("changelog", "暂无更新说明")
+        if len(changelog) > 600:
+            changelog = changelog[:600] + "\n..."
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("发现新版本")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(
+            f"发现新版本 v{info['version']}\n"
+            f"当前版本 v{__version__}\n\n"
+            f"更新内容：\n{changelog}"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.button(QMessageBox.Yes).setText("立即更新")
+        msg.button(QMessageBox.No).setText("稍后提醒")
+
+        if msg.exec() == QMessageBox.Yes:
+            self._do_update(info["download_url"])
+
+    def _do_update(self, download_url: str):
+        """执行下载和更新流程，带进度条"""
+        progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        progress.setWindowTitle("更新中")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        self._cancelled = False
+
+        def on_cancel():
+            self._cancelled = True
+        progress.canceled.connect(on_cancel)
+
+        class _DownloadThread(QThread):
+            progress_update = Signal(int)
+            finished_ok = Signal(str)     # zip_path
+            finished_err = Signal(str)    # error message
+
+            def __init__(self_t, url):
+                super().__init__()
+                self_t.url = url
+
+            def run(self_t):
+                try:
+                    from updater import download_update
+                    zip_path = download_update(
+                        self_t.url,
+                        progress_callback=self_t.progress_update.emit
+                    )
+                    self_t.finished_ok.emit(zip_path)
+                except Exception as e:
+                    self_t.finished_err.emit(str(e))
+
+        def on_progress(percent):
+            if not self._cancelled:
+                progress.setValue(percent)
+                progress.setLabelText(f"正在下载更新... {percent}%")
+                QApplication.processEvents()
+
+        def on_download_ok(zip_path):
+            progress.setValue(100)
+            progress.setLabelText("下载完成，正在应用更新...")
+            QApplication.processEvents()
+
+            from updater import apply_update
+            success = apply_update(zip_path)
+            if not success:
+                progress.close()
+                QMessageBox.warning(
+                    self, "更新失败",
+                    "应用更新时出错，程序将继续使用当前版本。\n"
+                    "你可以稍后手动从 GitHub Release 页面下载最新版本。"
+                )
+
+        def on_download_err(err_msg):
+            progress.close()
+            if not self._cancelled:
+                QMessageBox.warning(
+                    self, "下载失败",
+                    f"下载更新时出错：\n{err_msg}\n\n"
+                    "请检查网络连接，或稍后手动从 GitHub Release 页面下载。"
+                )
+
+        self._dl_thread = _DownloadThread(download_url)
+        self._dl_thread.progress_update.connect(on_progress)
+        self._dl_thread.finished_ok.connect(on_download_ok)
+        self._dl_thread.finished_err.connect(on_download_err)
+        self._dl_thread.start()
 
     # ---------------- UI enable ----------------
     def set_enabled(self, enabled: bool):

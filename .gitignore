@@ -6,3 +6,4 @@ dist/
 *.log
 *.txt
 *.b64
+_old_version_backup/

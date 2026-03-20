@@ -107,6 +107,13 @@ sys.excepthook = _global_excepthook
 
 def main():
     try:
+        # ── 清理上次更新遗留的旧版本文件夹 ──
+        try:
+            from updater import cleanup_old_version
+            cleanup_old_version()
+        except Exception:
+            pass  # updater 模块不存在或清理失败，不影响正常启动
+
         # Windows 任务栏图标：设置 AppUserModelID，让系统把 exe 图标正确关联到任务栏
         if sys.platform == "win32":
             try:
