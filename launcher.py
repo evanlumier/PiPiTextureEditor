@@ -119,7 +119,7 @@ def main():
             try:
                 import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "PiPi.TextureTool.v04"
+                    "PiPi.TextureEditor.皮皮贴图修改器"
                 )
             except Exception:
                 pass

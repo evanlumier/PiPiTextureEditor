@@ -687,13 +687,16 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("PPEditor")
-        # 设置窗口左上角图标（兼容打包环境）
+        # 设置窗口左上角图标（兼容打包环境，多路径回退查找）
+        _ico_name = "TextureToolGUI.ico"
+        _candidates = []
         if getattr(sys, 'frozen', False):
-            _base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            _candidates.append(os.path.join(os.path.dirname(sys.executable), _ico_name))
+            _candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _ico_name))
         else:
-            _base = os.path.dirname(os.path.abspath(__file__))
-        _ico_path = os.path.join(_base, "TextureToolGUI.ico")
-        if os.path.exists(_ico_path):
+            _candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ico_name))
+        _ico_path = next((p for p in _candidates if os.path.exists(p)), None)
+        if _ico_path:
             from PySide6.QtGui import QIcon
             self.setWindowIcon(QIcon(_ico_path))
         self.resize(1180, 740)
@@ -1998,13 +2001,16 @@ def main():
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
     try:
         app = QApplication(sys.argv)
-        # 给整个应用设置图标（任务栏图标）
+        # 给整个应用设置图标（任务栏图标，多路径回退查找）
+        _ico_name = "TextureToolGUI.ico"
+        _candidates = []
         if getattr(sys, 'frozen', False):
-            _base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            _candidates.append(os.path.join(os.path.dirname(sys.executable), _ico_name))
+            _candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _ico_name))
         else:
-            _base = os.path.dirname(os.path.abspath(__file__))
-        _ico_path = os.path.join(_base, "TextureToolGUI.ico")
-        if os.path.exists(_ico_path):
+            _candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ico_name))
+        _ico_path = next((p for p in _candidates if os.path.exists(p)), None)
+        if _ico_path:
             from PySide6.QtGui import QIcon
             app.setWindowIcon(QIcon(_ico_path))
         initial = pick_initial_path(sys.argv)
