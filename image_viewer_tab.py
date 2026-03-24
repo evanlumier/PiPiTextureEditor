@@ -389,6 +389,11 @@ class _CheckerWidget(QWidget):
         self._eyedropper_hover_timer.setInterval(500)
         self._eyedropper_hover_timer.timeout.connect(self._on_eyedropper_hover_timeout)
 
+        # ---- 底色预览 ----
+        # 状态循环: 0=无背景(棋盘格), 1=黑色背景, 2=白色背景
+        self._bg_color_state = 0
+        self._bg_btn_rect = QRectF(8, 8, 24, 24)  # 左上角按钮区域
+
         # 吸取成功动效状态
         self._eyedropper_pick_anim_progress = 0.0  # 0.0~1.0，0 表示无动效
         self._eyedropper_pick_anim_pos: Optional[QPointF] = None  # 动效中心位置
@@ -568,22 +573,30 @@ class _CheckerWidget(QWidget):
         dst = QRectF(self._offset.x(), self._offset.y(),
                      pw * self._scale, ph * self._scale)
 
-        # 棋盘格（只在图片区域绘制）
+        # 底色 / 棋盘格（只在图片区域绘制）
         clip = dst.intersected(QRectF(self.rect()))
         if not clip.isEmpty():
-            c1, c2 = QColor(200, 200, 200), QColor(255, 255, 255)
-            cell = max(4, int(self._cell * min(self._scale, 1.0)))
-            x0 = int(clip.left())
-            y0 = int(clip.top())
-            x1 = int(clip.right())
-            y1 = int(clip.bottom())
-            for y in range(y0, y1, cell):
-                for x in range(x0, x1, cell):
-                    row = (y - int(dst.y())) // cell
-                    col = (x - int(dst.x())) // cell
-                    painter.fillRect(x, y,
-                                     min(cell, x1 - x), min(cell, y1 - y),
-                                     c1 if (row + col) % 2 == 0 else c2)
+            if self._bg_color_state == 1:
+                # 黑色背景
+                painter.fillRect(clip, QColor(0, 0, 0))
+            elif self._bg_color_state == 2:
+                # 白色背景
+                painter.fillRect(clip, QColor(255, 255, 255))
+            else:
+                # 默认棋盘格
+                c1, c2 = QColor(200, 200, 200), QColor(255, 255, 255)
+                cell = max(4, int(self._cell * min(self._scale, 1.0)))
+                x0 = int(clip.left())
+                y0 = int(clip.top())
+                x1 = int(clip.right())
+                y1 = int(clip.bottom())
+                for y in range(y0, y1, cell):
+                    for x in range(x0, x1, cell):
+                        row = (y - int(dst.y())) // cell
+                        col = (x - int(dst.x())) // cell
+                        painter.fillRect(x, y,
+                                         min(cell, x1 - x), min(cell, y1 - y),
+                                         c1 if (row + col) % 2 == 0 else c2)
 
         # 绘制图片
         if is_svg:
@@ -600,6 +613,9 @@ class _CheckerWidget(QWidget):
         # 吸取成功动效（独立于吸管模式，可在动效播放中即使已关闭吸管）
         if self._eyedropper_pick_anim_progress > 0:
             self._paint_pick_animation(painter)
+
+        # ---- 左上角底色预览切换按钮 ----
+        self._paint_bg_toggle_btn(painter)
 
         painter.end()
 
@@ -630,6 +646,13 @@ class _CheckerWidget(QWidget):
         self.view_changed.emit()
 
     def mousePressEvent(self, event: QMouseEvent):
+        # 底色预览按钮点击检测（优先级最高）
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._bg_btn_rect.contains(event.position()):
+                # 循环切换: 0(棋盘格) → 1(黑色) → 2(白色) → 0(棋盘格)
+                self._bg_color_state = (self._bg_color_state + 1) % 3
+                self.update()
+                return
         # 吸管模式：左键取色
         if self._eyedropper_mode and event.button() == Qt.MouseButton.LeftButton:
             color = self._get_pixel_color(event.position())
@@ -754,6 +777,60 @@ class _CheckerWidget(QWidget):
             self._eyedropper_pick_anim_color = None
             self._eyedropper_pick_anim_timer.stop()
         self.update()
+
+    def _paint_bg_toggle_btn(self, painter: QPainter):
+        """绘制左上角的底色预览切换按钮：一个斜切成黑白两色的小方块"""
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        btn = self._bg_btn_rect  # QRectF(8, 8, 24, 24)
+        radius = 4
+
+        # 按钮背景圆角矩形裁剪路径
+        btn_path = QPainterPath()
+        btn_path.addRoundedRect(btn, radius, radius)
+        painter.setClipPath(btn_path)
+
+        # 斜切成两半：左上三角为白色，右下三角为黑色
+        # 白色半边（左上三角）
+        white_tri = QPainterPath()
+        white_tri.moveTo(btn.topLeft())
+        white_tri.lineTo(btn.topRight())
+        white_tri.lineTo(btn.bottomLeft())
+        white_tri.closeSubpath()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawPath(white_tri)
+
+        # 黑色半边（右下三角）
+        black_tri = QPainterPath()
+        black_tri.moveTo(btn.topRight())
+        black_tri.lineTo(btn.bottomRight())
+        black_tri.lineTo(btn.bottomLeft())
+        black_tri.closeSubpath()
+        painter.setBrush(QColor(0, 0, 0))
+        painter.drawPath(black_tri)
+
+        painter.setClipping(False)
+
+        # 根据当前状态绘制高亮指示
+        if self._bg_color_state == 1:
+            # 黑色背景激活：右下角画一个小圆点指示
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 200, 50))
+            painter.drawEllipse(QPointF(btn.right() - 5, btn.bottom() - 5), 3, 3)
+        elif self._bg_color_state == 2:
+            # 白色背景激活：左上角画一个小圆点指示
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 200, 50))
+            painter.drawEllipse(QPointF(btn.left() + 5, btn.top() + 5), 3, 3)
+
+        # 按钮边框
+        painter.setPen(QPen(QColor(120, 120, 140), 1.2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(btn, radius, radius)
+
+        painter.restore()
 
     def _paint_pick_animation(self, painter: QPainter):
         """绘制吸取成功的扩散光环动效"""

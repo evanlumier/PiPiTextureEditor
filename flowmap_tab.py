@@ -95,8 +95,8 @@ def _bilinear_sample_wrap(img: np.ndarray, fx: np.ndarray, fy: np.ndarray) -> np
     fx_w = fx % w
     fy_w = fy % h
 
-    x0 = np.floor(fx_w).astype(np.int32)
-    y0 = np.floor(fy_w).astype(np.int32)
+    x0 = np.floor(fx_w).astype(np.int32) % w
+    y0 = np.floor(fy_w).astype(np.int32) % h
     x1 = (x0 + 1) % w
     y1 = (y0 + 1) % h
 

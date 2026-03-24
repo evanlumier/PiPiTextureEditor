@@ -546,10 +546,12 @@ class CropDialog(QDialog):
 
     def _on_ok(self):
         cropped = self.canvas.get_cropped_image()
-        if cropped is None:
-            QMessageBox.warning(self, "裁切失败", "请先创建一个有效裁切框。")
-            return
-        self.result_img = cropped.convert("RGBA")
+        if cropped is not None:
+            # 有裁切框：应用裁切
+            self.result_img = cropped.convert("RGBA")
+        else:
+            # 无裁切框：直接使用当前图片（可能已旋转）
+            self.result_img = self.canvas.pil_img.convert("RGBA")
         self.accept()
 
 
