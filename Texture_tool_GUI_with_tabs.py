@@ -1363,14 +1363,16 @@ class MainWindow(QMainWindow):
         """在后台线程中检查 GitHub Release 是否有新版本"""
         class _UpdateThread(QThread):
             update_found = Signal(dict)
+            check_failed = Signal()
             def run(self_t):
                 try:
                     from updater import check_for_update
                     result = check_for_update()
                     if result:
                         self_t.update_found.emit(result)
+                    # result 为 None 时静默（可能是已是最新版或网络问题）
                 except Exception:
-                    pass  # 静默失败
+                    self_t.check_failed.emit()
 
         self._update_thread = _UpdateThread(self)
         self._update_thread.update_found.connect(self._on_update_found)
@@ -1398,15 +1400,15 @@ class MainWindow(QMainWindow):
             self._do_update(info["download_url"])
 
     def _do_update(self, download_url: str):
-        """执行下载和更新流程，带完整进度条（下载 0~50%，应用更新 50~100%）"""
+        """执行下载和更新流程（下载阶段显示详细信息，安装阶段显示进度条）"""
         import threading
 
-        progress = QProgressDialog("准备更新...", "取消", 0, 100, self)
+        progress = QProgressDialog("准备更新...", "取消", 0, 0, self)
         progress.setWindowTitle("更新中")
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
-        progress.setValue(0)
+        progress.setMinimumWidth(380)
         progress.show()
         QApplication.processEvents()
 
@@ -1419,8 +1421,8 @@ class MainWindow(QMainWindow):
 
         # ── 后台线程：负责下载 + 应用更新 ──
         class _UpdateWorkerThread(QThread):
-            # 下载进度信号 (percent 0-100, 仅下载部分)
-            download_progress = Signal(int)
+            # 下载进度信号（传递 dict 包含 downloaded_str, speed_str, eta_str 等）
+            download_progress = Signal(object)
             # 应用更新进度信号 (percent 0-100, stage 描述)
             apply_progress = Signal(int, str)
             # 下载完成信号
@@ -1467,17 +1469,37 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self_t.finished_err.emit(str(e))
 
-        def on_download_progress(percent):
-            """下载阶段：映射到总进度 0% ~ 50%"""
-            if not self._stop_event.is_set():
-                total_pct = int(percent * 0.5)
-                progress.setValue(total_pct)
-                progress.setLabelText(f"正在下载更新... {percent}%")
+        def on_download_progress(info):
+            """下载阶段：显示已下载大小、速度、预计剩余时间等详细信息"""
+            if not self._stop_event.is_set() and isinstance(info, dict):
+                downloaded_str = info.get("downloaded_str", "")
+                speed_str = info.get("speed_str", "")
+                elapsed_str = info.get("elapsed_str", "")
+                eta_str = info.get("eta_str", "")
+                total_str = info.get("total_str", "")
+                percent = info.get("percent", -1)
+                
+                # 如果有总大小信息（urllib 下载），显示百分比进度条
+                if percent >= 0:
+                    if progress.maximum() == 0:
+                        progress.setRange(0, 100)
+                    progress.setValue(int(percent * 0.5))  # 下载占前50%
+                    label = (f"正在下载更新... {percent}%\n"
+                             f"已下载：{downloaded_str} / {total_str}\n"
+                             f"速度：{speed_str}　　预计剩余：{eta_str}")
+                else:
+                    # curl 下载没有总大小信息，使用跑马灯模式
+                    label = (f"正在下载更新...\n"
+                             f"已下载：{downloaded_str}　　速度：{speed_str}\n"
+                             f"已用时间：{elapsed_str}")
+                
+                progress.setLabelText(label)
                 QApplication.processEvents()
 
         def on_download_done():
-            """下载完成，切换到应用更新阶段"""
+            """下载完成，切换到应用更新阶段（恢复为确定进度条）"""
             if not self._stop_event.is_set():
+                progress.setRange(0, 100)
                 progress.setValue(50)
                 progress.setLabelText("下载完成，准备安装...")
                 # 下载完成后禁用取消按钮（应用更新不可中断）
