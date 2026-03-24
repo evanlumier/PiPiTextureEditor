@@ -7,15 +7,17 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageEnhance, ImageOps
 
-from PySide6.QtCore import Qt, QRect, QPoint, QRegularExpression, QSize, QThread, Signal
+from PySide6.QtCore import Qt, QRect, QPoint, QRegularExpression, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QPixmap,
     QImage,
     QPainter,
+    QPainterPath,
     QPen,
     QColor,
     QRegularExpressionValidator,
     QFontMetrics,
+    QIcon,
 )
 
 from PySide6.QtWidgets import (
@@ -303,7 +305,6 @@ class CropCanvas(QLabel):
         if not self.sel_rect:
             p.end()
             return
-        from PySide6.QtGui import QPainterPath
 
         path = QPainterPath()
         path.addRect(self.rect())
@@ -699,7 +700,6 @@ class MainWindow(QMainWindow):
             _candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ico_name))
         _ico_path = next((p for p in _candidates if os.path.exists(p)), None)
         if _ico_path:
-            from PySide6.QtGui import QIcon
             self.setWindowIcon(QIcon(_ico_path))
         self.resize(1180, 740)
 
@@ -1062,6 +1062,42 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
         self._tabs = tabs  # 保存引用，供跨 tab 切换使用
 
+        # ── 左下角 bug 按钮（覆盖在主窗口上，绝对定位） ──
+        self._bug_btn = QPushButton(self)
+        self._bug_btn.setFixedSize(32, 32)
+        self._bug_btn.setCursor(Qt.PointingHandCursor)
+        self._bug_btn.setToolTip("关于 / 检查更新")
+        self._bug_btn.clicked.connect(self._show_about_dialog)
+
+        _svg_name = "bug.svg"
+        _svg_candidates = []
+        if getattr(sys, 'frozen', False):
+            _svg_candidates.append(os.path.join(os.path.dirname(sys.executable), _svg_name))
+            _svg_candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _svg_name))
+        else:
+            _svg_candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _svg_name))
+        _svg_path = next((p for p in _svg_candidates if os.path.exists(p)), None)
+        if _svg_path:
+            self._bug_btn.setIcon(QIcon(_svg_path))
+            self._bug_btn.setIconSize(QSize(22, 22))
+
+        self._bug_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #313244;
+                border-color: #45475a;
+            }
+            QPushButton:pressed {
+                background-color: #45475a;
+            }
+        """)
+        self._bug_btn.raise_()  # 确保在最上层
+
         # Tab 1: 贴图修改（原有功能）
         root = QWidget()
         main_layout = QHBoxLayout(root)
@@ -1355,14 +1391,143 @@ class MainWindow(QMainWindow):
         if initial_path:
             self.load_image(initial_path)
 
+        # ── 隐藏菜单栏（帮助功能已移至左下角 bug 按钮） ──
+        self.menuBar().setVisible(False)
+
         # ── 后台检查更新 ──
         self._start_update_checker()
 
+    # ---------------- 关于弹窗 ----------------
+    def _show_about_dialog(self):
+        """点击 bug 按钮后弹出「关于」对话框，包含版本信息和检查更新按钮"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("关于 PPEditor")
+        dlg.setFixedSize(360, 320)
+        dlg.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e2e;
+                border: 1px solid #383850;
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #cdd6f4;
+                background: transparent;
+            }
+            QPushButton {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: 1px solid #45475a;
+                border-radius: 7px;
+                padding: 8px 20px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+                border-color: #89b4fa;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #89b4fa;
+                color: #1e1e2e;
+            }
+        """)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+        layout.setContentsMargins(28, 24, 28, 20)
+
+        # 应用名称
+        title_label = QLabel("PPEditor")
+        title_label.setStyleSheet("font-size: 22px; font-weight: 700; color: #89b4fa;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+
+        # 版本号
+        ver_label = QLabel(f"版本 v{__version__}")
+        ver_label.setStyleSheet("font-size: 14px; color: #a6adc8;")
+        ver_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(ver_label)
+
+        layout.addSpacing(6)
+
+        # 描述
+        desc_label = QLabel(
+            "皮皮贴图修改器 —— 一站式游戏贴图工具集\n\n"
+            "功能：贴图修改 / 精灵图制作 / 法线绘制\n"
+            "　　　灰度图生成 / 全能看图"
+        )
+        desc_label.setStyleSheet("font-size: 12px; color: #6c7086;")
+        desc_label.setAlignment(Qt.AlignCenter)
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
+
+        # 作者
+        author_label = QLabel("© evanlumier")
+        author_label.setStyleSheet("font-size: 11px; color: #585b70;")
+        author_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(author_label)
+
+        layout.addStretch()
+
+        # 检查更新按钮
+        btn_check = QPushButton("检查更新")
+        btn_check.setCursor(Qt.PointingHandCursor)
+        layout.addWidget(btn_check)
+
+        # 状态标签（检查更新反馈）
+        self._about_status_label = QLabel("")
+        self._about_status_label.setAlignment(Qt.AlignCenter)
+        self._about_status_label.setWordWrap(True)
+        self._about_status_label.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        self._about_status_label.hide()
+        layout.addWidget(self._about_status_label)
+
+        def _on_check_clicked():
+            btn_check.setEnabled(False)
+            btn_check.setText("正在检查...")
+            self._about_status_label.hide()
+            self._about_dlg = dlg  # 保存对话框引用，用于回调时更新
+            self._about_check_btn = btn_check
+            self._manual_check_update()
+
+        btn_check.clicked.connect(_on_check_clicked)
+
+        dlg.exec()
+
+        # 对话框关闭后清理引用
+        self._about_dlg = None
+        self._about_check_btn = None
+        self._about_status_label = None
+
+    def _manual_check_update(self):
+        """用户手动点击「检查更新」"""
+        self._start_update_checker(manual=True)
+
     # ---------------- 在线更新 ----------------
-    def _start_update_checker(self):
-        """在后台线程中检查 GitHub Release 是否有新版本"""
+    def _start_update_checker(self, manual: bool = False):
+        """
+        在后台线程中检查 GitHub Release 是否有新版本。
+        manual=True 时为用户手动触发，会显示「已是最新版本」或「检查失败」提示；
+        manual=False 时为启动自动检查，静默失败不打扰用户。
+        """
+        self._manual_update_check = manual
+
+        # 如果上一个检查线程仍在运行，先等待它结束
+        if hasattr(self, '_update_thread') and self._update_thread is not None:
+            if self._update_thread.isRunning():
+                self._update_thread.wait(2000)
+            # 断开旧线程的所有信号连接，防止信号累积
+            try:
+                self._update_thread.update_found.disconnect()
+                self._update_thread.no_update.disconnect()
+                self._update_thread.check_failed.disconnect()
+            except RuntimeError:
+                pass
+
         class _UpdateThread(QThread):
             update_found = Signal(dict)
+            no_update = Signal()
             check_failed = Signal()
             def run(self_t):
                 try:
@@ -1370,16 +1535,59 @@ class MainWindow(QMainWindow):
                     result = check_for_update()
                     if result:
                         self_t.update_found.emit(result)
-                    # result 为 None 时静默（可能是已是最新版或网络问题）
+                    else:
+                        self_t.no_update.emit()
                 except Exception:
                     self_t.check_failed.emit()
 
         self._update_thread = _UpdateThread(self)
         self._update_thread.update_found.connect(self._on_update_found)
+        self._update_thread.no_update.connect(self._on_no_update)
+        self._update_thread.check_failed.connect(self._on_check_failed)
         self._update_thread.start()
+
+    def _on_no_update(self):
+        """没有新版本时的回调（仅手动检查时提示）"""
+        if getattr(self, '_manual_update_check', False):
+            self._manual_update_check = False
+            # 在关于对话框内显示反馈
+            if getattr(self, '_about_status_label', None) and getattr(self, '_about_dlg', None):
+                self._about_status_label.setText("✅ 已是最新版本")
+                self._about_status_label.setStyleSheet("font-size: 12px; color: #a6e3a1;")
+                self._about_status_label.show()
+                if self._about_check_btn:
+                    self._about_check_btn.setText("检查更新")
+                    self._about_check_btn.setEnabled(True)
+            else:
+                QMessageBox.information(
+                    self, "检查更新",
+                    f"当前版本 v{__version__} 已是最新版本。"
+                )
+
+    def _on_check_failed(self):
+        """检查更新失败的回调（仅手动检查时提示）"""
+        if getattr(self, '_manual_update_check', False):
+            self._manual_update_check = False
+            # 在关于对话框内显示反馈
+            if getattr(self, '_about_status_label', None) and getattr(self, '_about_dlg', None):
+                self._about_status_label.setText("❌ 无法连接更新服务器，请检查网络")
+                self._about_status_label.setStyleSheet("font-size: 12px; color: #f38ba8;")
+                self._about_status_label.show()
+                if self._about_check_btn:
+                    self._about_check_btn.setText("检查更新")
+                    self._about_check_btn.setEnabled(True)
+            else:
+                QMessageBox.warning(
+                    self, "检查更新",
+                    "无法连接到更新服务器，请检查网络后重试。"
+                )
 
     def _on_update_found(self, info: dict):
         """收到新版本信息后弹窗提示用户"""
+        # 关闭关于对话框（如果还开着）
+        if getattr(self, '_about_dlg', None):
+            self._about_dlg.accept()
+
         changelog = info.get("changelog", "暂无更新说明")
         if len(changelog) > 600:
             changelog = changelog[:600] + "\n..."
@@ -1562,13 +1770,6 @@ class MainWindow(QMainWindow):
         self.chk_overwrite.setEnabled(enabled)
 
     # ---------------- file ----------------
-    def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.tga *.bmp *.webp)"
-        )
-        if path:
-            self.load_image(path)
-
     def load_image(self, path: str):
         try:
             img = Image.open(path).convert("RGBA")
@@ -1583,26 +1784,24 @@ class MainWindow(QMainWindow):
             self.output_basename = None
 
             # reset sliders/spin to 100
-            for w in (
-                self.brightness_slider,
-                self.contrast_slider,
-            ):
-                w.blockSignals(True)
+            _block_widgets = (self.brightness_slider, self.contrast_slider)
+            try:
+                for w in _block_widgets:
+                    w.blockSignals(True)
 
-            self.brightness_slider.setValue(100)
-            self.contrast_slider.setValue(100)
-            self.brightness_spin.setText("100%")
-            self.contrast_spin.setText("100%")
-
-            for w in (
-                self.brightness_slider,
-                self.contrast_slider,
-            ):
-                w.blockSignals(False)
+                self.brightness_slider.setValue(100)
+                self.contrast_slider.setValue(100)
+                self.brightness_spin.setText("100%")
+                self.contrast_spin.setText("100%")
+            finally:
+                for w in _block_widgets:
+                    w.blockSignals(False)
 
             self.name_input.blockSignals(True)
-            self.name_input.setText("")
-            self.name_input.blockSignals(False)
+            try:
+                self.name_input.setText("")
+            finally:
+                self.name_input.blockSignals(False)
             self.update_name_preview()
 
             self.rebuild_working()
@@ -2022,10 +2221,44 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败：\n{e}")
 
+    def _reposition_bug_btn(self):
+        """将 bug 按钮固定在窗口左下角（tab bar 列的底部）"""
+        if not hasattr(self, '_bug_btn'):
+            return
+        tab_bar = self._tabs.tabBar()
+        bar_pos = tab_bar.mapTo(self, QPoint(0, 0))
+        btn = self._bug_btn
+        x = bar_pos.x() + (tab_bar.width() - btn.width()) // 2
+        y = self.height() - btn.height() - 10
+        btn.move(x, y)
+        btn.raise_()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.preview_img is not None:
             self.update_preview()
+        self._reposition_bug_btn()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 首次显示时 tab bar 布局可能尚未完成，延迟一帧再定位
+        QTimer.singleShot(0, self._reposition_bug_btn)
+
+    def closeEvent(self, event):
+        """窗口关闭时，确保后台线程安全结束，防止退出崩溃"""
+        # 等待更新检查线程结束
+        if hasattr(self, '_update_thread') and self._update_thread is not None:
+            if self._update_thread.isRunning():
+                self._update_thread.quit()
+                self._update_thread.wait(3000)
+        # 等待下载线程结束
+        if hasattr(self, '_dl_thread') and self._dl_thread is not None:
+            if hasattr(self, '_stop_event'):
+                self._stop_event.set()
+            if self._dl_thread.isRunning():
+                self._dl_thread.quit()
+                self._dl_thread.wait(3000)
+        super().closeEvent(event)
 
 
 def pick_initial_path(argv) -> Optional[str]:
