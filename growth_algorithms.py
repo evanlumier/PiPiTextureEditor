@@ -9,7 +9,7 @@ growth_algorithms.py
 
 import os
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Iterator, Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -209,24 +209,72 @@ def final_mask_from_sequence(
 # 主入口
 # ─────────────────────────────────────────────────────────────────────
 
+def cross_frame_auto_detect(
+    sample_frames: List[Image.Image],
+) -> Tuple[str, bool]:
+    """
+    跨帧 auto 判定：采样若干帧，分析亮度/alpha 跨帧变化量，
+    决定应使用 alpha 还是 luminance 模式。
+
+    参数：
+        sample_frames — 均匀采样的 PIL RGBA 帧列表（建议 ≤16 帧）
+
+    返回：
+        (force_mode, triggered)
+        force_mode  — "alpha" / "luminance" / ""（空串=未触发，由单帧 auto 自行判定）
+        triggered   — 是否触发了跨帧强制判定
+    """
+    LUM_STABLE_THRESH  = 0.04
+    ALPHA_VARY_THRESH  = 0.04
+
+    if len(sample_frames) < 2:
+        return "", False
+
+    lum_means = []
+    alpha_means = []
+    for f in sample_frames:
+        if f.mode != "RGBA":
+            f = f.convert("RGBA")
+        a = np.array(f, dtype=np.float32)
+        lum = (a[:, :, 0] * 0.299 + a[:, :, 1] * 0.587 + a[:, :, 2] * 0.114) / 255.0
+        alp = a[:, :, 3] / 255.0
+        lum_means.append(float(lum.mean()))
+        alpha_means.append(float(alp.mean()))
+
+    lum_std   = float(np.std(lum_means))
+    alpha_std = float(np.std(alpha_means))
+
+    if lum_std < LUM_STABLE_THRESH and alpha_std > ALPHA_VARY_THRESH:
+        return "alpha", True
+
+    return "", False
+
+
 def generate_growth_gray_from_sequence(
-    frames: List[Image.Image],
+    frame_iter: Iterator[Image.Image],
+    frame_count: int,
     source_mode: str = "auto",
     presence_blur: float = 0.0,
     hit_threshold: float = 0.2,
     mask_threshold: float = 0.05,
     invert: bool = False,
+    force_mode: str = "",
+    progress_callback=None,
 ) -> dict:
     """
-    将一组序列帧自动转换为生长灰度图。
+    将帧迭代器（序列帧或视频）流式转换为生长灰度图。
+    内存中同一时刻仅保留 1 帧 + 若干 H×W 累加 map，不存储全部帧。
 
     参数：
-        frames          — PIL RGBA 图像列表（已按时间顺序排好）
-        source_mode     — "auto" / "alpha" / "luminance"
-        presence_blur   — 单帧模糊半径（0 = 不模糊）
-        hit_threshold   — 首次过阈判定阈值（0~1）
-        mask_threshold  — 最终 mask 阈值（0~1）
-        invert          — 是否反转灰度（gray = 1 - gray）
+        frame_iter        — 帧迭代器，逐帧 yield PIL Image（已按时间顺序）
+        frame_count       — 总帧数（用于归一化和进度显示）
+        source_mode       — "auto" / "alpha" / "luminance"
+        presence_blur     — 单帧模糊半径（0 = 不模糊）
+        hit_threshold     — 首次过阈判定阈值（0~1）
+        mask_threshold    — 最终 mask 阈值（0~1）
+        invert            — 是否反转灰度（gray = 1 - gray）
+        force_mode        — 跨帧 auto 判定的结果（由调用方通过 cross_frame_auto_detect 预先计算）
+        progress_callback — 可选，接受 (current_frame: int, total: int) 的回调函数
 
     返回 dict：
         "gray_map"        : H×W float32，最终灰度图（mask 外为 0）
@@ -234,103 +282,105 @@ def generate_growth_gray_from_sequence(
         "first_presence"  : H×W float32，第一帧占位图（用于预览）
         "last_envelope"   : H×W float32，最后一帧单调包络（用于预览）
         "frame_count"     : int，帧数
+        "actual_mode"     : str，实际使用的识别方式
+        "alpha_lum_diff"  : float，alpha 与亮度的均值差（0~1）
+        "cross_frame_triggered" : bool，是否由跨帧分析强制切换
     """
-    if not frames:
-        raise ValueError("frames 列表不能为空")
+    if frame_count <= 0:
+        raise ValueError("frame_count 必须 > 0")
 
-    N = len(frames)
+    N = frame_count
+    _cross_frame_triggered = bool(force_mode)
 
-    # ── 跨帧 auto 判定（在生成占位图前先分析整组帧）──────────────────
-    # 目标：如果 RGB 亮度在序列中接近恒定，但 Alpha 明显变化，
-    #       则强制判定为 alpha 模式，不受单帧 alpha.max()==255 的干扰。
-    #
-    # 实现：对每帧采样（最多取 16 帧均匀采样，避免大序列过慢）
-    #   lum_std_mean  = 各帧亮度图均值的标准差（跨帧变化量）
-    #   alpha_std_mean = 各帧 alpha 图均值的标准差（跨帧变化量）
-    #   判定条件：
-    #     lum_std_mean  < LUM_STABLE_THRESH   （亮度几乎不变）
-    #     alpha_std_mean > ALPHA_VARY_THRESH   （alpha 明显变化）
-    #   → 强制 alpha
-    LUM_STABLE_THRESH  = 0.04   # 亮度跨帧均值标准差阈值（0~1）
-    ALPHA_VARY_THRESH  = 0.04   # alpha 跨帧均值标准差阈值（0~1）
+    # ── 流式逐帧处理 ─────────────────────────────────────────────────
+    running_envelope: Optional[np.ndarray] = None   # 单调包络（cumulative max）
+    first_hit_frame: Optional[np.ndarray] = None    # 每像素首次过阈的帧索引
+    already_hit: Optional[np.ndarray] = None        # 每像素是否已命中
+    first_presence: Optional[np.ndarray] = None     # 第一帧占位图
+    alpha_lum_diff: float = 0.0                     # alpha 与亮度均值差
+    actual_mode_final: str = "auto"
+    alpha_count = 0
+    lum_count = 0
+    processed = 0
 
-    _force_mode = ""            # 跨帧分析给出的强制模式（仅 auto 时使用）
-    _cross_frame_triggered = False  # 是否触发了跨帧强制判定
+    for i, frame in enumerate(frame_iter):
+        # 转换为占位图
+        presence, actual_mode = rgba_to_presence_map(
+            frame, source_mode, presence_blur, force_mode
+        )
 
-    if source_mode == "auto" and N >= 2:
-        # 均匀采样最多 16 帧
-        sample_step = max(1, N // 16)
-        sample_indices = list(range(0, N, sample_step))[:16]
+        # 统计实际模式
+        if actual_mode == "alpha":
+            alpha_count += 1
+        else:
+            lum_count += 1
 
-        lum_means = []
-        alpha_means = []
-        for idx in sample_indices:
-            f = frames[idx]
-            if f.mode != "RGBA":
-                f = f.convert("RGBA")
-            a = np.array(f, dtype=np.float32)
-            lum = (a[:, :, 0] * 0.299 + a[:, :, 1] * 0.587 + a[:, :, 2] * 0.114) / 255.0
-            alp = a[:, :, 3] / 255.0
-            lum_means.append(float(lum.mean()))
-            alpha_means.append(float(alp.mean()))
+        if i == 0:
+            H, W = presence.shape
+            first_presence = presence.copy()
+            running_envelope = presence.copy()
+            first_hit_frame = np.full((H, W), -1, dtype=np.int32)
+            already_hit = np.zeros((H, W), dtype=bool)
 
-        lum_std   = float(np.std(lum_means))
-        alpha_std = float(np.std(alpha_means))
+            # 计算 alpha 与亮度差异（用于提示用户）
+            if frame.mode != "RGBA":
+                frame = frame.convert("RGBA")
+            arr0 = np.array(frame, dtype=np.float32)
+            alpha_norm = arr0[:, :, 3] / 255.0
+            lum_norm = (
+                arr0[:, :, 0] * 0.299
+                + arr0[:, :, 1] * 0.587
+                + arr0[:, :, 2] * 0.114
+            ) / 255.0
+            alpha_lum_diff = float(np.abs(alpha_norm - lum_norm).mean())
+        else:
+            np.maximum(running_envelope, presence, out=running_envelope)
 
-        if lum_std < LUM_STABLE_THRESH and alpha_std > ALPHA_VARY_THRESH:
-            _force_mode = "alpha"
-            _cross_frame_triggered = True
+        # 逐帧判定首次过阈
+        newly_hit = (~already_hit) & (running_envelope >= hit_threshold)
+        first_hit_frame[newly_hit] = i
+        already_hit |= newly_hit
 
-    # ── 每帧 → 占位图 ────────────────────────────────────────────────
-    raw_results = [
-        rgba_to_presence_map(f, source_mode, presence_blur, _force_mode)
-        for f in frames
-    ]
-    presence_maps: List[np.ndarray] = [r[0] for r in raw_results]
-    actual_modes: List[str] = [r[1] for r in raw_results]
+        processed += 1
+        if progress_callback is not None:
+            progress_callback(processed, N)
 
-    # 统计实际使用的模式（取多数帧的结果）
-    alpha_count = actual_modes.count("alpha")
-    lum_count = actual_modes.count("luminance")
+        # frame 和 presence 在下一轮循环时自动被 GC 回收
+
+    if processed == 0:
+        raise ValueError("帧迭代器未产生任何帧")
+
+    # ── 最终计算 ─────────────────────────────────────────────────────
     actual_mode_final = "alpha" if alpha_count >= lum_count else "luminance"
 
-    # 计算 alpha 与亮度的差异（用于提示用户检查识别方式）
-    # 取第一帧做差异检测：alpha 归一化值 vs 亮度归一化值，均值差
-    arr0 = np.array(frames[0].convert("RGBA"), dtype=np.float32)
-    alpha_norm = arr0[:, :, 3] / 255.0
-    lum_norm = (
-        arr0[:, :, 0] * 0.299
-        + arr0[:, :, 1] * 0.587
-        + arr0[:, :, 2] * 0.114
-    ) / 255.0
-    alpha_lum_diff = float(np.abs(alpha_norm - lum_norm).mean())
+    # 归一化首次过阈时间 → 灰度
+    if N > 1:
+        gray = first_hit_frame.astype(np.float32) / float(N - 1)
+    else:
+        gray = np.zeros_like(first_hit_frame, dtype=np.float32)
 
-    # 2. 单调包络
-    envelope_maps = build_monotonic_envelope(presence_maps)
+    # 未命中区域设为 1.0
+    gray[first_hit_frame < 0] = 1.0
 
-    # 3. 首次过阈时间图
-    gray = compute_first_hit_time(envelope_maps, hit_threshold)
+    # 最终 mask（来自最后一帧包络）
+    mask = final_mask_from_sequence(running_envelope, mask_threshold)
 
-    # 4. 最终 mask（来自最后一帧包络）
-    mask = final_mask_from_sequence(envelope_maps[-1], mask_threshold)
-
-    # 5. mask 外清零
+    # mask 外清零
     gray = gray * mask
 
-    # 6. 可选反转
+    # 可选反转
     if invert:
-        # 只在 mask 内反转，mask 外保持 0
         gray = np.where(mask > 0, 1.0 - gray, 0.0).astype(np.float32)
 
     return {
-        "gray_map":               gray,
+        "gray_map":               gray.astype(np.float32),
         "mask_map":               mask,
-        "first_presence":         presence_maps[0],
-        "last_envelope":          envelope_maps[-1],
-        "frame_count":            N,
-        "actual_mode":            actual_mode_final,    # 实际使用的识别方式
-        "alpha_lum_diff":         alpha_lum_diff,        # alpha 与亮度的均值差（0~1）
-        "cross_frame_triggered":  _cross_frame_triggered,  # 是否由跨帧分析强制切换
+        "first_presence":         first_presence,
+        "last_envelope":          running_envelope,
+        "frame_count":            processed,
+        "actual_mode":            actual_mode_final,
+        "alpha_lum_diff":         alpha_lum_diff,
+        "cross_frame_triggered":  _cross_frame_triggered,
     }
 
 

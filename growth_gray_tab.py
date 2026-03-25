@@ -45,15 +45,24 @@ from PySide6.QtWidgets import (
 from growth_algorithms import (
     natural_sort_key,
     generate_growth_gray_from_sequence,
+    cross_frame_auto_detect,
     rasterize_stroke_to_seed,
     propagate_seed_to_gray,
     smooth_gray_map,
 )
 
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:
+    _HAS_CV2 = False
+
 # ── 常量 ──────────────────────────────────────────────────────────────
 CANVAS_W = 512
 CANVAS_H = 512
 SUPPORTED_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp")
+SUPPORTED_VIDEO_EXTS = (".mp4", ".avi", ".mov", ".webm", ".mkv", ".flv")
+PREVIEW_LIMIT = 1024  # 画布预览最大边长（超过此尺寸时使用缩放代理图，提升交互流畅度）
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
@@ -110,6 +119,38 @@ def checkerboard_qpixmap(w: int, h: int, cell: int = 16) -> QPixmap:
             p.fillRect(col, row, cell, cell, color)
     p.end()
     return QPixmap.fromImage(img)
+
+
+def _preview_scale_factor(w: int, h: int) -> float:
+    """计算预览缩放因子，使最长边不超过 PREVIEW_LIMIT。
+    返回 1.0 表示无需缩放。"""
+    max_side = max(w, h)
+    if max_side <= PREVIEW_LIMIT:
+        return 1.0
+    return PREVIEW_LIMIT / max_side
+
+
+def _downscale_array(arr: np.ndarray, factor: float) -> np.ndarray:
+    """将 H×W 的 float32 数组按比例缩小（最近邻采样，用于预览加速）。"""
+    if factor >= 1.0:
+        return arr
+    h, w = arr.shape
+    new_h = max(1, int(h * factor))
+    new_w = max(1, int(w * factor))
+    # 使用 PIL 进行缩放（比 numpy 循环快得多）
+    from PIL import Image as _PILImage
+    pil_img = _PILImage.fromarray((np.clip(arr, 0.0, 1.0) * 65535).astype(np.uint16), mode="I;16")
+    pil_small = pil_img.resize((new_w, new_h), _PILImage.BILINEAR)
+    return np.array(pil_small, dtype=np.float32) / 65535.0
+
+
+def _downscale_pil(img: Image.Image, factor: float) -> Image.Image:
+    """将 PIL Image 按比例缩小（用于预览加速）。"""
+    if factor >= 1.0:
+        return img
+    new_w = max(1, int(img.width * factor))
+    new_h = max(1, int(img.height * factor))
+    return img.resize((new_w, new_h), Image.BILINEAR)
 
 
 def _sorted_image_files(folder: str) -> List[str]:
@@ -225,6 +266,120 @@ def _seed_map_to_qpixmap(seed_map: np.ndarray) -> QPixmap:
     rgba_c = np.ascontiguousarray(rgba)
     qi = QImage(rgba_c.data, w, h, w * 4, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qi.copy())
+
+
+# ── 可折叠分组框 ──────────────────────────────────────────────────────
+class CollapsibleGroupBox(QWidget):
+    """
+    可折叠的分组框：标题栏带 ▼/▶ 箭头按钮，点击可折叠/展开内部内容。
+    用法与 QGroupBox 类似，通过 content_layout 添加子控件。
+    """
+
+    def __init__(self, title: str = "", color: str = "#a6adc8",
+                 border_color: str = "#585b70", collapsed: bool = False, parent=None):
+        super().__init__(parent)
+        self._collapsed = collapsed
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        # 主布局
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 外框容器（模拟 QGroupBox 样式）
+        self._frame = QFrame()
+        self._frame.setStyleSheet(
+            f"QFrame#collapsible_frame {{ border:1px solid {border_color}; border-radius:8px;"
+            f"margin-top:7px; padding:0px; }}"
+        )
+        self._frame.setObjectName("collapsible_frame")
+        frame_lay = QVBoxLayout(self._frame)
+        frame_lay.setContentsMargins(6, 4, 6, 6)
+        frame_lay.setSpacing(0)
+
+        # 标题按钮
+        arrow = "▶" if collapsed else "▼"
+        self._toggle_btn = QPushButton(f"{arrow}  {title}")
+        self._toggle_btn.setFlat(True)
+        self._toggle_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._toggle_btn.setStyleSheet(
+            f"QPushButton {{ color:{color}; font-size:11px; font-weight:700;"
+            f"text-align:left; padding:4px 2px; border:none; }}"
+            f"QPushButton:hover {{ color:#cdd6f4; }}"
+        )
+        self._toggle_btn.clicked.connect(self._toggle)
+        self._title = title
+        self._color = color
+        frame_lay.addWidget(self._toggle_btn)
+
+        # 内容区域
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(0, 4, 0, 0)
+        self._content_layout.setSpacing(6)
+        self._content.setVisible(not collapsed)
+        frame_lay.addWidget(self._content)
+
+        outer.addWidget(self._frame)
+
+    @property
+    def content_layout(self) -> QVBoxLayout:
+        """获取内容区域的 layout，用于添加子控件。"""
+        return self._content_layout
+
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self._content.setVisible(not self._collapsed)
+        arrow = "▶" if self._collapsed else "▼"
+        self._toggle_btn.setText(f"{arrow}  {self._title}")
+        self._refresh_ancestor_layouts()
+
+    def set_collapsed(self, collapsed: bool):
+        self._collapsed = collapsed
+        self._content.setVisible(not collapsed)
+        arrow = "▶" if collapsed else "▼"
+        self._toggle_btn.setText(f"{arrow}  {self._title}")
+        self._refresh_ancestor_layouts()
+
+    def _refresh_ancestor_layouts(self):
+        """递归向上刷新所有祖先的布局，确保折叠/展开后尺寸正确收缩。"""
+        from PySide6.QtWidgets import QScrollArea
+        from PySide6.QtCore import QTimer
+
+        # 第一步：沿着 widget 树向上，invalidate 每一级 layout
+        w = self
+        while w is not None:
+            w.updateGeometry()
+            lay = w.layout()
+            if lay:
+                lay.invalidate()
+            if isinstance(w, QScrollArea):
+                break
+            w = w.parentWidget()
+
+        # 第二步：从 QScrollArea 的 inner widget 开始，重新 activate 布局
+        # 这样 Qt 会根据 sizeHint / sizePolicy 重新分配空间
+        scroll = w if isinstance(w, QScrollArea) else None
+        if scroll:
+            inner = scroll.widget()
+            if inner and inner.layout():
+                inner.layout().activate()
+            # 让 QScrollArea 根据新的 sizeHint 重新决定是否需要滚动条
+            scroll.updateGeometry()
+
+        # 延迟再刷新一次，应对异步布局更新
+        QTimer.singleShot(0, lambda: self._deferred_refresh(scroll))
+
+    @staticmethod
+    def _deferred_refresh(scroll):
+        """延迟刷新：确保 QScrollArea 正确更新。"""
+        if scroll is None:
+            return
+        inner = scroll.widget()
+        if inner and inner.layout():
+            inner.layout().invalidate()
+            inner.layout().activate()
+        scroll.updateGeometry()
 
 
 # ── 小预览标签 ────────────────────────────────────────────────────────
@@ -593,6 +748,15 @@ class GrowthGrayTab(QWidget):
         self._output_basename: Optional[str] = None           # 导出基础名
         self._seq_generated: bool = False                     # 是否已生成过序列帧灰度图
 
+        # ── 预览代理缓存（大图加速）──
+        self._preview_factor: float = 1.0                     # 预览缩放因子
+        self._checker_cache: Optional[QPixmap] = None         # 缓存的棋盘格
+        self._checker_cache_size: tuple = (0, 0)              # 缓存尺寸
+        self._seq_file_paths: List[str] = []                  # 序列帧文件路径（延迟加载用）
+        self._video_path: Optional[str] = None                # 视频文件路径
+        self._video_frame_count: int = 0                      # 视频总帧数
+        self._video_sample_interval: int = 1                  # 视频帧采样间隔
+
         # ── 防抖 Timer（参数变化后延迟 600ms 自动重新生成）──────────────
         from PySide6.QtCore import QTimer
         self._auto_regen_timer = QTimer(self)
@@ -851,15 +1015,11 @@ class GrowthGrayTab(QWidget):
         right = QVBoxLayout(right_inner)
         right.setContentsMargins(4, 4, 4, 4)
         right.setSpacing(8)
+        right.setSizeConstraint(QVBoxLayout.SetMinAndMaxSize)
 
         # ── 模式切换（最顶部）──
-        mode_group = QGroupBox("工作模式")
-        mode_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
-        )
-        mode_layout = QVBoxLayout(mode_group)
+        mode_group = CollapsibleGroupBox("工作模式", color="#89b4fa", border_color="#89b4fa")
+        mode_layout = mode_group.content_layout
         mode_layout.setSpacing(4)
 
         self.btn_mode_seq = QPushButton("🎞  序列帧自动生成")
@@ -893,18 +1053,14 @@ class GrowthGrayTab(QWidget):
         # ── 序列帧模式控件区 ──
         # ═══════════════════════════════════════════════════════════════
         self._seq_controls = QWidget()
+        self._seq_controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         seq_ctrl_layout = QVBoxLayout(self._seq_controls)
         seq_ctrl_layout.setContentsMargins(0, 0, 0, 0)
         seq_ctrl_layout.setSpacing(8)
 
         # 导入
-        seq_import_group = QGroupBox("导入序列帧")
-        seq_import_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
-        )
-        sig = QVBoxLayout(seq_import_group)
+        seq_import_group = CollapsibleGroupBox("导入序列帧", color="#89b4fa", border_color="#89b4fa")
+        sig = seq_import_group.content_layout
         sig.setSpacing(6)
 
         self.btn_import_seq = QPushButton("选择序列帧文件夹")
@@ -912,6 +1068,37 @@ class GrowthGrayTab(QWidget):
             "background:#313244; color:#cdd6f4; border-radius:5px; padding:6px;"
         )
         sig.addWidget(self.btn_import_seq)
+
+        # 视频导入按钮
+        self.btn_import_video = QPushButton("🎬 导入视频")
+        self.btn_import_video.setStyleSheet(
+            "background:#313244; color:#cdd6f4; border-radius:5px; padding:6px;"
+        )
+        self.btn_import_video.setToolTip(
+            "从视频文件（MP4/MOV/AVI/WebM）中提取帧并生成灰度图\n"
+            "省去手动导出序列帧的步骤"
+        )
+        sig.addWidget(self.btn_import_video)
+
+        # 帧采样间隔控件（视频导入时可用）
+        sample_row = QHBoxLayout()
+        sample_row.setSpacing(4)
+        sample_row.addWidget(QLabel("帧采样："))
+        self.spin_video_sample = QSpinBox()
+        self.spin_video_sample.setRange(1, 30)
+        self.spin_video_sample.setValue(1)
+        self.spin_video_sample.setSuffix(" 帧取1帧")
+        self.spin_video_sample.setToolTip(
+            "每隔 N 帧取一帧参与计算\n"
+            "1 = 全部帧（最精确）\n"
+            "2 = 隔一帧取一帧（速度翻倍）\n"
+            "5 = 每5帧取一帧（适合长视频）"
+        )
+        sample_row.addWidget(self.spin_video_sample)
+        self._video_sample_widget = QWidget()
+        self._video_sample_widget.setLayout(sample_row)
+        self._video_sample_widget.setVisible(False)  # 默认隐藏，导入视频后显示
+        sig.addWidget(self._video_sample_widget)
 
         self.lbl_seq_import_info = QLabel("未导入")
         self.lbl_seq_import_info.setStyleSheet("color:#6c7086; font-size:10px;")
@@ -921,13 +1108,8 @@ class GrowthGrayTab(QWidget):
         seq_ctrl_layout.addWidget(seq_import_group)
 
         # 内容识别设置
-        seq_recog_group = QGroupBox("内容识别设置")
-        seq_recog_group.setStyleSheet(
-            "QGroupBox { border:1px solid #cba6f7; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#cba6f7; left:10px; }"
-        )
-        srg = QVBoxLayout(seq_recog_group)
+        seq_recog_group = CollapsibleGroupBox("内容识别设置", color="#cba6f7", border_color="#cba6f7")
+        srg = seq_recog_group.content_layout
         srg.setSpacing(8)
 
         # 内容识别方式
@@ -994,13 +1176,8 @@ class GrowthGrayTab(QWidget):
         seq_ctrl_layout.addWidget(seq_recog_group)
 
         # 主体保留范围
-        seq_range_group = QGroupBox("主体保留范围")
-        seq_range_group.setStyleSheet(
-            "QGroupBox { border:1px solid #a6e3a1; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#a6e3a1; left:10px; }"
-        )
-        srrg = QVBoxLayout(seq_range_group)
+        seq_range_group = CollapsibleGroupBox("主体保留范围", color="#a6e3a1", border_color="#a6e3a1")
+        srrg = seq_range_group.content_layout
         srrg.setSpacing(8)
 
         # 识别灵敏度
@@ -1052,13 +1229,8 @@ class GrowthGrayTab(QWidget):
         seq_ctrl_layout.addWidget(seq_range_group)
 
         # 生成结果
-        seq_gen_group = QGroupBox("生成结果")
-        seq_gen_group.setStyleSheet(
-            "QGroupBox { border:1px solid #f38ba8; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#f38ba8; left:10px; }"
-        )
-        sgg = QVBoxLayout(seq_gen_group)
+        seq_gen_group = CollapsibleGroupBox("生成结果", color="#f38ba8", border_color="#f38ba8")
+        sgg = seq_gen_group.content_layout
         sgg.setSpacing(8)
 
         # 反转生长顺序
@@ -1094,18 +1266,14 @@ class GrowthGrayTab(QWidget):
         # ── 单图模式控件区 ──
         # ═══════════════════════════════════════════════════════════════
         self._single_controls = QWidget()
+        self._single_controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         single_ctrl_layout = QVBoxLayout(self._single_controls)
         single_ctrl_layout.setContentsMargins(0, 0, 0, 0)
         single_ctrl_layout.setSpacing(8)
 
         # 导入
-        single_import_group = QGroupBox("导入单图")
-        single_import_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
-        )
-        siig = QVBoxLayout(single_import_group)
+        single_import_group = CollapsibleGroupBox("导入单图", color="#89b4fa", border_color="#89b4fa")
+        siig = single_import_group.content_layout
         siig.setSpacing(6)
 
         self.btn_import_single = QPushButton("选择图像文件")
@@ -1122,13 +1290,8 @@ class GrowthGrayTab(QWidget):
         single_ctrl_layout.addWidget(single_import_group)
 
         # 主体范围生成
-        single_mask_group = QGroupBox("主体范围识别")
-        single_mask_group.setStyleSheet(
-            "QGroupBox { border:1px solid #a6e3a1; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#a6e3a1; left:10px; }"
-        )
-        smg = QVBoxLayout(single_mask_group)
+        single_mask_group = CollapsibleGroupBox("主体范围识别", color="#a6e3a1", border_color="#a6e3a1")
+        smg = single_mask_group.content_layout
         smg.setSpacing(6)
 
         self.btn_mask_from_alpha = QPushButton("按透明度识别主体")
@@ -1178,13 +1341,8 @@ class GrowthGrayTab(QWidget):
         single_ctrl_layout.addWidget(single_mask_group)
 
         # 路径扩散设置
-        prop_group = QGroupBox("路径扩散设置")
-        prop_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
-        )
-        ppg = QVBoxLayout(prop_group)
+        prop_group = CollapsibleGroupBox("路径扩散设置", color="#89b4fa", border_color="#89b4fa")
+        ppg = prop_group.content_layout
         ppg.setSpacing(8)
 
         # 扩散范围
@@ -1269,10 +1427,25 @@ class GrowthGrayTab(QWidget):
         # 注意：不在这里 addWidget，统一放入 _mode_stack
 
         # ── 模式切换堆叠区（序列帧 / 单图，同一时间只显示一个）──
-        # 用 QStackedWidget 替代两个并列 QWidget，避免隐藏控件 geometry
-        # 停留在默认 640x480 覆盖可见控件，导致输入框无法点击的问题
+        # 用自适应高度的 QStackedWidget，只取当前页面的 sizeHint，
+        # 避免折叠后其他页面撑高导致间距过大
         from PySide6.QtWidgets import QStackedWidget
-        self._mode_stack = QStackedWidget()
+
+        class _AdaptiveStack(QStackedWidget):
+            """sizeHint / minimumSizeHint 只反映当前可见页面，折叠后立即收缩。"""
+            def sizeHint(self):
+                w = self.currentWidget()
+                if w:
+                    return w.sizeHint()
+                return super().sizeHint()
+            def minimumSizeHint(self):
+                w = self.currentWidget()
+                if w:
+                    return w.minimumSizeHint()
+                return super().minimumSizeHint()
+
+        self._mode_stack = _AdaptiveStack()
+        self._mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self._mode_stack.addWidget(self._seq_controls)     # index 0
         self._mode_stack.addWidget(self._single_controls)  # index 1
         self._mode_stack.setCurrentIndex(0)
@@ -1280,16 +1453,11 @@ class GrowthGrayTab(QWidget):
         right.addWidget(self._mode_stack)
 
         # ── 路径细节叠加（噪波）──
-        noise_group = QGroupBox("路径细节叠加")
-        noise_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:14px; padding-top:14px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
-        )
+        noise_group = CollapsibleGroupBox("路径细节叠加", color="#89b4fa", border_color="#89b4fa", collapsed=True)
         noise_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        ng = QVBoxLayout(noise_group)
+        ng = noise_group.content_layout
         ng.setSpacing(4)
-        ng.setContentsMargins(6, 2, 6, 6)
+        ng.setContentsMargins(0, 0, 0, 0)
 
         # 启用开关
         self.chk_noise_enable = QCheckBox("启用噪波叠加")
@@ -1480,13 +1648,8 @@ class GrowthGrayTab(QWidget):
         right.addWidget(noise_group)
 
         # ── 导出区（始终显示）──
-        export_group = QGroupBox("导出")
-        export_group.setStyleSheet(
-            "QGroupBox { border:1px solid #585b70; border-radius:8px;"
-            "margin-top:14px; padding-top:10px; }"
-            "QGroupBox::title { color:#a6adc8; left:10px; }"
-        )
-        eg = QVBoxLayout(export_group)
+        export_group = CollapsibleGroupBox("导出", color="#a6adc8", border_color="#585b70")
+        eg = export_group.content_layout
         eg.setSpacing(6)
 
         eg.addWidget(QLabel("导出命名（tag）："))
@@ -1503,6 +1666,38 @@ class GrowthGrayTab(QWidget):
 
         self.btn_apply_name = QPushButton("应用命名")
         eg.addWidget(self.btn_apply_name)
+
+        eg.addWidget(self._hline())
+
+        # 导出尺寸选择
+        eg.addWidget(QLabel("导出尺寸："))
+        _pow2 = ["原始尺寸", "32", "64", "128", "256", "512", "1024", "2048"]
+        size_row = QHBoxLayout()
+        size_row.setSpacing(2)
+        _lbl_w = QLabel("宽:")
+        _lbl_w.setFixedWidth(20)
+        size_row.addWidget(_lbl_w)
+        self.export_size_w = QComboBox()
+        self.export_size_w.setEditable(True)
+        self.export_size_w.addItems(_pow2)
+        self.export_size_w.setCurrentText("原始尺寸")
+        self.export_size_w.setMinimumWidth(90)
+        size_row.addWidget(self.export_size_w, 1)
+        size_row.addSpacing(4)
+        _lbl_h = QLabel("高:")
+        _lbl_h.setFixedWidth(20)
+        size_row.addWidget(_lbl_h)
+        self.export_size_h = QComboBox()
+        self.export_size_h.setEditable(True)
+        self.export_size_h.addItems(_pow2)
+        self.export_size_h.setCurrentText("原始尺寸")
+        self.export_size_h.setMinimumWidth(90)
+        size_row.addWidget(self.export_size_h, 1)
+        eg.addLayout(size_row)
+        _hint_size = QLabel("选择\"原始尺寸\"则按原图分辨率导出，也可输入自定义数值")
+        _hint_size.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_size.setWordWrap(True)
+        eg.addWidget(_hint_size)
 
         eg.addWidget(self._hline())
 
@@ -1657,6 +1852,7 @@ class GrowthGrayTab(QWidget):
         # 导入
         self.btn_import_single.clicked.connect(self._import_single)
         self.btn_import_seq.clicked.connect(self._import_sequence)
+        self.btn_import_video.clicked.connect(self._import_video)
 
         # Mask
         self.btn_mask_from_alpha.clicked.connect(self._gen_mask_from_alpha)
@@ -1817,15 +2013,23 @@ class GrowthGrayTab(QWidget):
 
         self.source_image = img
         self.sequence_frames = []
+        self._seq_file_paths = []
         self._src_path = path
         self._output_basename = os.path.splitext(os.path.basename(path))[0]
 
         h, w = img.height, img.width
+        # 计算预览缩放因子
+        self._preview_factor = _preview_scale_factor(w, h)
+        self._checker_cache = None  # 清除缓存
+
         self.seed_map = np.full((h, w), -1.0, dtype=np.float32)
         self.gray_map = np.zeros((h, w), dtype=np.float32)
         self.mask_map = None
 
-        px = pil_to_qpixmap(img)
+        # 预览使用缩放代理
+        f = self._preview_factor
+        preview_img = _downscale_pil(img, f) if f < 1.0 else img
+        px = pil_to_qpixmap(preview_img)
         # 同步到单图预览区
         self.lbl_src_single.set_pixmap(px)
         self.lbl_mask_single.set_pixmap(None)
@@ -1878,45 +2082,328 @@ class GrowthGrayTab(QWidget):
         if not files:
             QMessageBox.warning(self, "导入失败", "文件夹内未找到支持的图像文件。")
             return
+
+        # 只加载首帧和尾帧用于预览，保存路径列表延迟加载
         try:
-            frames = [Image.open(f).convert("RGBA") for f in files]
+            first_frame = Image.open(files[0]).convert("RGBA")
+            last_frame = Image.open(files[-1]).convert("RGBA") if len(files) > 1 else first_frame
         except Exception as ex:
             QMessageBox.warning(self, "导入失败", str(ex))
             return
 
-        self.sequence_frames = frames
-        self.source_image = frames[0]
+        # 保存路径列表，实际帧在生成时按需加载
+        self._seq_file_paths = files
+        self._video_path = None          # 清空视频路径（序列帧与视频互斥）
+        self._video_frame_count = 0
+        self._video_sample_widget.setVisible(False)  # 隐藏视频帧采样控件
+        self.sequence_frames = []  # 清空，生成时再按需加载
+        # source_image 使用最后一帧（内容最完整），生长预览依赖此帧的 alpha 做纹理显隐
+        self.source_image = last_frame
         self._src_path = folder
         self._output_basename = os.path.basename(folder.rstrip("/\\"))
         self._seq_generated = False  # 重置生成标记
 
-        h, w = frames[0].height, frames[0].width
+        h, w = last_frame.height, last_frame.width
+        # 计算预览缩放因子
+        self._preview_factor = _preview_scale_factor(w, h)
+        self._checker_cache = None  # 清除缓存
+
         self.seed_map = np.full((h, w), -1.0, dtype=np.float32)
         self.gray_map = np.zeros((h, w), dtype=np.float32)
         self.mask_map = None
+        self.base_gray_map = None
+        self.final_gray_map = None
+        self.noise_map = None
 
-        first_px = pil_to_qpixmap(frames[0])
-        last_px = pil_to_qpixmap(frames[-1])
+        # 预览使用缩放代理
+        f = self._preview_factor
+        preview_first = _downscale_pil(first_frame, f) if f < 1.0 else first_frame
+        preview_last = _downscale_pil(last_frame, f) if f < 1.0 else last_frame
+        first_px = pil_to_qpixmap(preview_first)
+        last_px = pil_to_qpixmap(preview_last)
         self.lbl_src.set_pixmap(first_px)
         self.lbl_last_frame.set_pixmap(last_px)
         self.lbl_mask.set_pixmap(None)
         self.lbl_gray.set_pixmap(None)
         self.lbl_presence.set_pixmap(None)
         self.lbl_envelope.set_pixmap(None)
-        self.canvas.set_source(first_px)
+        # 画布底图使用最后一帧（与 source_image 一致，内容最完整）
+        self.canvas.set_source(last_px)
         self.canvas._fit_to_view()
         self.lbl_seq_import_info.setText(
-            f"{len(frames)} 帧 · {os.path.basename(folder)}\n尺寸：{w}×{h}"
+            f"{len(files)} 帧 · {os.path.basename(folder)}\n尺寸：{w}×{h}"
         )
-        self.lbl_seq_status.setText(f"已导入 {len(frames)} 帧，点击按钮生成灰度图")
+        self.lbl_seq_status.setText(f"已导入 {len(files)} 帧，点击按钮生成灰度图")
         if not self.name_input.text():
             self.name_input.setText(self._output_basename)
         self._refresh_canvas_overlay()
 
+    # ── 视频导入 ───────────────────────────────────────────────────────
+    def _import_video(self):
+        """从视频文件导入帧（仅读取首尾帧预览 + 记录路径和帧数）。"""
+        global _HAS_CV2
+        if not _HAS_CV2:
+            reply = QMessageBox.question(
+                self, "缺少依赖",
+                "视频导入需要 opencv-python 库，是否自动安装？\n\n"
+                "点击「Yes」将自动执行安装\n"
+                "点击「No」取消操作",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            # ── 非阻塞安装 opencv-python ──
+            import subprocess, sys
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "pip", "install", "opencv-python"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+            except Exception as ex:
+                QMessageBox.critical(self, "启动失败", f"无法启动 pip：\n{str(ex)}")
+                return
+
+            # 带取消按钮的进度对话框
+            from PySide6.QtWidgets import QProgressDialog
+            dlg = QProgressDialog("正在安装 opencv-python，请稍候...", "取消安装", 0, 0, self)
+            dlg.setWindowTitle("正在安装")
+            dlg.setWindowModality(Qt.WindowModal)
+            dlg.setMinimumDuration(0)
+            dlg.setValue(0)
+
+            # 用户点取消 → 终止子进程
+            def _on_cancel():
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            dlg.canceled.connect(_on_cancel)
+
+            # QTimer 轮询子进程状态（每 200ms）
+            timer = QTimer(self)
+            def _poll_install():
+                if dlg.wasCanceled():
+                    timer.stop()
+                    dlg.close()
+                    QMessageBox.information(self, "已取消", "安装已取消，不影响其他功能使用。")
+                    return
+                if proc.poll() is not None:
+                    # 子进程结束
+                    timer.stop()
+                    dlg.close()
+                    if proc.returncode != 0:
+                        stderr_text = proc.stderr.read().decode("utf-8", errors="replace")[:500]
+                        QMessageBox.critical(
+                            self, "安装失败",
+                            f"pip install opencv-python 失败：\n{stderr_text}"
+                        )
+                        return
+                    # 安装完成，严格验证能否导入
+                    try:
+                        import importlib
+                        cv2_mod = importlib.import_module("cv2")
+                        # 验证核心功能可用
+                        _ = cv2_mod.VideoCapture
+                        import cv2  # noqa: F811 — 写入当前模块命名空间
+                        _HAS_CV2 = True
+                        QMessageBox.information(self, "安装成功",
+                                                "opencv-python 安装成功！\n请再次点击「导入视频」按钮。")
+                    except Exception as ex:
+                        QMessageBox.critical(
+                            self, "导入失败",
+                            f"opencv-python 已安装但无法正常导入：\n{str(ex)}\n\n"
+                            "建议手动执行：pip install --force-reinstall opencv-python"
+                        )
+                    return
+            timer.timeout.connect(_poll_install)
+            timer.start(200)
+            return  # 先返回，等安装完成后用户再次点击按钮即可
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入视频", "",
+            "视频文件 (*.mp4 *.avi *.mov *.webm *.mkv *.flv);;所有文件 (*)"
+        )
+        if not path:
+            return
+
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise RuntimeError("无法打开视频文件")
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                raise RuntimeError("视频帧数为 0 或无法读取")
+
+            # 读取首帧
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, bgr_first = cap.read()
+            if not ret:
+                raise RuntimeError("无法读取视频首帧")
+            first_frame = self._cv2_to_pil(bgr_first)
+
+            # 读取尾帧
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+            ret, bgr_last = cap.read()
+            if not ret:
+                # 某些视频 seek 到最后一帧可能失败，尝试倒退几帧
+                for offset in range(2, min(10, total_frames)):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - offset)
+                    ret, bgr_last = cap.read()
+                    if ret:
+                        break
+                if not ret:
+                    bgr_last = bgr_first  # fallback 到首帧
+            last_frame = self._cv2_to_pil(bgr_last)
+
+            cap.release()
+        except Exception as ex:
+            QMessageBox.warning(self, "导入失败", str(ex))
+            return
+
+        # 保存视频信息
+        self._video_path = path
+        self._video_frame_count = total_frames
+        self._seq_file_paths = []  # 清空序列帧路径（互斥）
+        self.sequence_frames = []
+        self._seq_generated = False
+
+        # 使用尾帧作为 source_image（内容最完整）
+        self.source_image = last_frame
+        self._src_path = path
+        self._output_basename = os.path.splitext(os.path.basename(path))[0]
+
+        h, w = last_frame.height, last_frame.width
+        self._preview_factor = _preview_scale_factor(w, h)
+        self._checker_cache = None
+
+        self.seed_map = np.full((h, w), -1.0, dtype=np.float32)
+        self.gray_map = np.zeros((h, w), dtype=np.float32)
+        self.mask_map = None
+        self.base_gray_map = None
+        self.final_gray_map = None
+        self.noise_map = None
+
+        # 预览
+        f = self._preview_factor
+        preview_first = _downscale_pil(first_frame, f) if f < 1.0 else first_frame
+        preview_last = _downscale_pil(last_frame, f) if f < 1.0 else last_frame
+        first_px = pil_to_qpixmap(preview_first)
+        last_px = pil_to_qpixmap(preview_last)
+        self.lbl_src.set_pixmap(first_px)
+        self.lbl_last_frame.set_pixmap(last_px)
+        self.lbl_mask.set_pixmap(None)
+        self.lbl_gray.set_pixmap(None)
+        self.lbl_presence.set_pixmap(None)
+        self.lbl_envelope.set_pixmap(None)
+        self.canvas.set_source(last_px)
+        self.canvas._fit_to_view()
+
+        # 显示帧采样控件
+        self._video_sample_widget.setVisible(True)
+        # 根据帧数自动建议采样间隔
+        if total_frames > 500:
+            self.spin_video_sample.setValue(5)
+        elif total_frames > 200:
+            self.spin_video_sample.setValue(2)
+        else:
+            self.spin_video_sample.setValue(1)
+
+        fps = cap.get(cv2.CAP_PROP_FPS) if _HAS_CV2 else 0
+        # 重新打开获取 fps（cap 已 release）
+        try:
+            cap2 = cv2.VideoCapture(path)
+            fps = cap2.get(cv2.CAP_PROP_FPS)
+            cap2.release()
+        except Exception:
+            fps = 0
+
+        duration = total_frames / fps if fps > 0 else 0
+        info_parts = [f"🎬 {os.path.basename(path)}"]
+        info_parts.append(f"{total_frames} 帧 · {w}×{h}")
+        if fps > 0:
+            info_parts.append(f"{fps:.1f}fps · {duration:.1f}s")
+        info_parts.append("⚠ 视频无透明通道，建议使用亮度识别")
+        self.lbl_seq_import_info.setText("\n".join(info_parts))
+        self.lbl_seq_status.setText(f"已导入视频 {total_frames} 帧，点击按钮生成灰度图")
+
+        if not self.name_input.text():
+            self.name_input.setText(self._output_basename)
+        self._refresh_canvas_overlay()
+
+    @staticmethod
+    def _cv2_to_pil(bgr_frame) -> Image.Image:
+        """将 OpenCV BGR 帧转为 PIL RGBA Image。"""
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb, "RGB").convert("RGBA")
+        return pil_img
+
+    def _iter_frames_from_video(self, video_path: str, sample_interval: int = 1):
+        """视频帧迭代器：逐帧解码，支持跳帧采样，用完即释放。"""
+        cap = cv2.VideoCapture(video_path)
+        idx = 0
+        try:
+            while cap.isOpened():
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                if idx % sample_interval == 0:
+                    yield self._cv2_to_pil(bgr)
+                idx += 1
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _iter_frames_from_paths(file_paths: List[str]):
+        """序列帧文件迭代器：逐张读取，用完即释放。"""
+        for p in file_paths:
+            yield Image.open(p).convert("RGBA")
+
+    def _sample_frames_for_auto_detect(self, max_samples: int = 16) -> List[Image.Image]:
+        """
+        为跨帧 auto 判定采样若干帧（不全量加载）。
+        支持序列帧路径和视频两种来源。
+        """
+        samples = []
+        if self._video_path and _HAS_CV2:
+            total = self._video_frame_count
+            interval = self._video_sample_interval
+            effective = total // max(interval, 1)
+            step = max(1, effective // max_samples)
+            cap = cv2.VideoCapture(self._video_path)
+            try:
+                for i in range(0, effective, step):
+                    if len(samples) >= max_samples:
+                        break
+                    frame_idx = i * interval
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, bgr = cap.read()
+                    if ret:
+                        samples.append(self._cv2_to_pil(bgr))
+            finally:
+                cap.release()
+        elif self._seq_file_paths:
+            total = len(self._seq_file_paths)
+            step = max(1, total // max_samples)
+            indices = list(range(0, total, step))[:max_samples]
+            for idx in indices:
+                try:
+                    samples.append(Image.open(self._seq_file_paths[idx]).convert("RGBA"))
+                except Exception:
+                    pass
+        return samples
+
     # ── 序列帧自动生成 ─────────────────────────────────────────────────
     def _generate_from_sequence(self):
-        if not self.sequence_frames:
-            QMessageBox.information(self, "提示", "请先导入序列帧文件夹。")
+        # 支持三种来源：视频文件 / 序列帧文件路径 / 已加载的帧列表
+        has_video = bool(self._video_path) and _HAS_CV2
+        has_paths = bool(self._seq_file_paths)
+        has_frames = bool(self.sequence_frames)
+        if not has_video and not has_paths and not has_frames:
+            QMessageBox.information(self, "提示", "请先导入序列帧文件夹或视频。")
             return
 
         # 读取参数
@@ -1927,17 +2414,53 @@ class GrowthGrayTab(QWidget):
         mask_threshold = self.dspin_mask_thresh.value()
         invert = self.chk_invert.isChecked()
 
-        self.lbl_seq_status.setText("计算中，请稍候…")
+        # ── 跨帧 auto 判定（预扫描采样帧）──
+        force_mode = ""
+        cross_triggered = False
+        if source_mode == "auto":
+            self.lbl_seq_status.setText("分析帧数据中…")
+            QApplication.processEvents()
+            sample_frames = self._sample_frames_for_auto_detect(16)
+            if len(sample_frames) >= 2:
+                force_mode, cross_triggered = cross_frame_auto_detect(sample_frames)
+            del sample_frames  # 释放采样帧
+
+        # ── 构建帧迭代器和帧数 ──
+        if has_video:
+            sample_interval = self.spin_video_sample.value()
+            self._video_sample_interval = sample_interval
+            frame_count = self._video_frame_count // max(sample_interval, 1)
+            frame_iter = self._iter_frames_from_video(self._video_path, sample_interval)
+            source_label = f"视频（每{sample_interval}帧取1帧）" if sample_interval > 1 else "视频"
+        elif has_paths:
+            frame_count = len(self._seq_file_paths)
+            frame_iter = self._iter_frames_from_paths(self._seq_file_paths)
+            source_label = "序列帧"
+        else:
+            # 兼容旧的已加载帧列表（理论上不再会走到这里）
+            frame_count = len(self.sequence_frames)
+            frame_iter = iter(self.sequence_frames)
+            source_label = "序列帧"
+
+        self.lbl_seq_status.setText(f"流式计算中（{frame_count} 帧），请稍候…")
         QApplication.processEvents()
+
+        def _progress_cb(current, total):
+            if current % max(1, total // 20) == 0:  # 每 5% 更新一次
+                self.lbl_seq_status.setText(f"计算中… {current}/{total} 帧")
+                QApplication.processEvents()
 
         try:
             result = generate_growth_gray_from_sequence(
-                frames=self.sequence_frames,
+                frame_iter=frame_iter,
+                frame_count=frame_count,
                 source_mode=source_mode,
                 presence_blur=presence_blur,
                 hit_threshold=hit_threshold,
                 mask_threshold=mask_threshold,
                 invert=invert,
+                force_mode=force_mode,
+                progress_callback=_progress_cb,
             )
         except Exception as ex:
             QMessageBox.warning(self, "生成失败", str(ex))
@@ -1951,6 +2474,10 @@ class GrowthGrayTab(QWidget):
         # 重置噪波叠加结果（基础图已更新）
         self.final_gray_map = None
         self.noise_map = None
+
+        # source_image 已在导入时设为尾帧，无需再更新
+        # 释放可能残留的帧列表
+        self.sequence_frames = []
 
         # 更新左栏预览
         bw_px = np_mask_to_qpixmap(self.mask_map)
@@ -2025,12 +2552,12 @@ class GrowthGrayTab(QWidget):
 
     def _schedule_auto_regen(self):
         """参数变化时启动防抖 Timer，600ms 后自动重新生成（仅在已生成过的情况下触发）。"""
-        if self._seq_generated and self.sequence_frames:
+        if self._seq_generated and (self.sequence_frames or self._seq_file_paths or self._video_path):
             self._auto_regen_timer.start()
 
     def _auto_regen_if_ready(self):
         """防抖 Timer 触发：自动重新生成序列帧灰度图。"""
-        if self._seq_generated and self.sequence_frames:
+        if self._seq_generated and (self.sequence_frames or self._seq_file_paths or self._video_path):
             self._generate_from_sequence()
 
     # ── Mask 生成 ──────────────────────────────────────────────────────
@@ -2119,6 +2646,12 @@ class GrowthGrayTab(QWidget):
         if self.seed_map is None:
             return
 
+        # 若使用缩放代理预览，需将画布坐标映射回原始分辨率
+        f = self._preview_factor
+        if f < 1.0:
+            inv = 1.0 / f
+            pts = [(int(x * inv), int(y * inv)) for (x, y) in pts]
+
         # 橡皮擦模式：将笔触覆盖的区域重置为 -1（未赋值）
         if value == -2.0:
             if self.seed_map is None:
@@ -2126,6 +2659,8 @@ class GrowthGrayTab(QWidget):
             self._push_seed_history()
             hardness = self.slider_hardness.value() / 100.0
             r = self.canvas.brush_radius
+            if f < 1.0:
+                r = max(1, int(r / f))
             # 复用 rasterize_stroke_to_seed 获取覆盖像素，然后将其重置为 -1
             # 创建一个临时 seed_map 来识别被擦除的像素
             import numpy as np
@@ -2154,6 +2689,8 @@ class GrowthGrayTab(QWidget):
 
         hardness = self.slider_hardness.value() / 100.0
         r = self.canvas.brush_radius
+        if f < 1.0:
+            r = max(1, int(r / f))
 
         # 笔触内部时间范围：从 0 到用户设定的 value
         # 这样单笔内部有渐变，多笔可以覆盖不同区间
@@ -2307,8 +2844,17 @@ class GrowthGrayTab(QWidget):
         self.edit_value.setText(f"{fv:.2f}")
 
     # ── 预览刷新 ──────────────────────────────────────────────────────
+    def _get_checker_cached(self, w: int, h: int) -> QPixmap:
+        """获取棋盘格 QPixmap（带缓存，避免重复生成）。"""
+        if self._checker_cache is not None and self._checker_cache_size == (w, h):
+            return self._checker_cache
+        self._checker_cache = checkerboard_qpixmap(w, h, 16)
+        self._checker_cache_size = (w, h)
+        return self._checker_cache
+
     def _refresh_canvas_overlay(self):
         idx = self.combo_overlay.currentIndex()
+        f = self._preview_factor  # 预览缩放因子
 
         # ── 生长预览模式（index 5）──
         if idx == 5:
@@ -2328,44 +2874,60 @@ class GrowthGrayTab(QWidget):
                     progress = 0.5
                 invert = self.chk_invert.isChecked() if hasattr(self, "chk_invert") else False
 
+                # 使用缩放代理计算预览（大图加速）
+                src_img = _downscale_pil(self.source_image, f) if f < 1.0 else self.source_image
+                gray_ds = _downscale_array(gray_for_preview, f) if f < 1.0 else gray_for_preview
+                mask_ds = _downscale_array(self.mask_map, f) if (f < 1.0 and self.mask_map is not None) else self.mask_map
+
                 preview_px = compute_growth_preview_pixmap(
-                    source_image=self.source_image,
-                    gray_map=gray_for_preview,
-                    mask_map=self.mask_map,
+                    source_image=src_img,
+                    gray_map=gray_ds,
+                    mask_map=mask_ds,
                     progress=progress,
                     invert=invert,
                 )
-                h = self.source_image.height
-                w = self.source_image.width
-                checker_px = checkerboard_qpixmap(w, h, 16)
+                ph, pw = src_img.height, src_img.width
+                checker_px = self._get_checker_cached(pw, ph)
                 self.canvas.set_source(checker_px)
                 self.canvas.set_overlay(preview_px, opaque=True)
             else:
                 self.canvas.set_overlay(None)
                 if self.source_image is not None:
-                    self.canvas.set_source(pil_to_qpixmap(self.source_image))
+                    self.canvas.set_source(pil_to_qpixmap(
+                        _downscale_pil(self.source_image, f) if f < 1.0 else self.source_image
+                    ))
             return
 
-        # 非生长预览模式：确保底图是原图
+        # 非生长预览模式：确保底图是原图（缩放代理）
         if self.source_image is not None:
-            self.canvas.set_source(pil_to_qpixmap(self.source_image))
+            self.canvas.set_source(pil_to_qpixmap(
+                _downscale_pil(self.source_image, f) if f < 1.0 else self.source_image
+            ))
 
         if idx == 0 or self.source_image is None:
             # 原图
             self.canvas.set_overlay(None)
         elif idx == 1 and self.mask_map is not None:
             # 原图 + 主体范围（青色蒙层）
-            self.canvas.set_overlay(np_mask_overlay_qpixmap(self.mask_map))
+            self.canvas.set_overlay(np_mask_overlay_qpixmap(
+                _downscale_array(self.mask_map, f) if f < 1.0 else self.mask_map
+            ))
         elif idx == 2 and self.gray_map is not None:
             # 原图 + 灰度结果（半透明灰度叠加）
-            self.canvas.set_overlay(np_gray_to_qpixmap(self.gray_map))
+            self.canvas.set_overlay(np_gray_to_qpixmap(
+                _downscale_array(self.gray_map, f) if f < 1.0 else self.gray_map
+            ))
         elif idx == 3 and self.gray_map is not None:
             # 仅灰度结果：把底图换成灰度图
-            self.canvas.set_source(np_gray_to_qpixmap(self.gray_map))
+            self.canvas.set_source(np_gray_to_qpixmap(
+                _downscale_array(self.gray_map, f) if f < 1.0 else self.gray_map
+            ))
             self.canvas.set_overlay(None)
         elif idx == 4 and self.final_gray_map is not None:
             # 仅叠加噪波后结果
-            self.canvas.set_source(np_gray_to_qpixmap(self.final_gray_map))
+            self.canvas.set_source(np_gray_to_qpixmap(
+                _downscale_array(self.final_gray_map, f) if f < 1.0 else self.final_gray_map
+            ))
             self.canvas.set_overlay(None)
         else:
             self.canvas.set_overlay(None)
@@ -2404,6 +2966,22 @@ class GrowthGrayTab(QWidget):
         self.name_preview.setText(f"预览：T_{tag}_Growth.png")
 
     # ── 导出 ──────────────────────────────────────────────────────────
+    def _get_export_size(self, orig_h: int, orig_w: int):
+        """根据导出尺寸 combo 解析目标宽高，返回 (w, h)。
+        如果选择"原始尺寸"或输入无效，返回 (orig_w, orig_h)。"""
+        def _parse(combo_text: str, orig: int) -> int:
+            t = combo_text.strip()
+            if t == "原始尺寸" or t == "":
+                return orig
+            try:
+                v = int(t)
+                return max(1, v)
+            except ValueError:
+                return orig
+        w = _parse(self.export_size_w.currentText(), orig_w)
+        h = _parse(self.export_size_h.currentText(), orig_h)
+        return w, h
+
     def _export_gray(self):
         if self.gray_map is None or self.source_image is None:
             QMessageBox.information(self, "提示", "请先导入图像并绘制路径。")
@@ -2437,9 +3015,15 @@ class GrowthGrayTab(QWidget):
         try:
             u8 = (np.clip(self.gray_map, 0.0, 1.0) * 255).astype(np.uint8)
             out_img = Image.fromarray(u8, mode="L")
+            # 按导出尺寸缩放
+            orig_h, orig_w = self.gray_map.shape
+            export_w, export_h = self._get_export_size(orig_h, orig_w)
+            if export_w != orig_w or export_h != orig_h:
+                out_img = out_img.resize((export_w, export_h), Image.BILINEAR)
             out_img.save(save_path)
-            self.lbl_export_info.setText(f"已导出：\n{os.path.basename(save_path)}")
-            QMessageBox.information(self, "导出成功", f"已保存到：\n{save_path}")
+            size_info = f"{export_w}×{export_h}"
+            self.lbl_export_info.setText(f"已导出：{size_info}\n{os.path.basename(save_path)}")
+            QMessageBox.information(self, "导出成功", f"尺寸：{size_info}\n已保存到：\n{save_path}")
         except Exception as ex:
             QMessageBox.warning(self, "导出失败", str(ex))
 
@@ -2478,9 +3062,15 @@ class GrowthGrayTab(QWidget):
         try:
             u8 = (np.clip(self.final_gray_map, 0.0, 1.0) * 255).astype(np.uint8)
             out_img = Image.fromarray(u8, mode="L")
+            # 按导出尺寸缩放
+            orig_h, orig_w = self.final_gray_map.shape
+            export_w, export_h = self._get_export_size(orig_h, orig_w)
+            if export_w != orig_w or export_h != orig_h:
+                out_img = out_img.resize((export_w, export_h), Image.BILINEAR)
             out_img.save(save_path)
-            self.lbl_export_info.setText(f"已导出（含噪波）：\n{os.path.basename(save_path)}")
-            QMessageBox.information(self, "导出成功", f"已保存到：\n{save_path}")
+            size_info = f"{export_w}×{export_h}"
+            self.lbl_export_info.setText(f"已导出（含噪波）：{size_info}\n{os.path.basename(save_path)}")
+            QMessageBox.information(self, "导出成功", f"尺寸：{size_info}\n已保存到：\n{save_path}")
         except Exception as ex:
             QMessageBox.warning(self, "导出失败", str(ex))
 
