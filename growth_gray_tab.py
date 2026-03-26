@@ -2184,11 +2184,16 @@ class GrowthGrayTab(QWidget):
 
             # QTimer 轮询子进程状态（每 200ms）
             timer = QTimer(self)
+            _cancel_handled = [False]  # 用列表包装以便闭包内修改
+
             def _poll_install():
+                global _HAS_CV2
                 if dlg.wasCanceled():
                     timer.stop()
-                    dlg.close()
-                    QMessageBox.information(self, "已取消", "安装已取消，不影响其他功能使用。")
+                    if not _cancel_handled[0]:
+                        _cancel_handled[0] = True
+                        dlg.close()
+                        QMessageBox.information(self, "已取消", "安装已取消，不影响其他功能使用。")
                     return
                 if proc.poll() is not None:
                     # 子进程结束
@@ -2312,8 +2317,8 @@ class GrowthGrayTab(QWidget):
         else:
             self.spin_video_sample.setValue(1)
 
-        fps = cap.get(cv2.CAP_PROP_FPS) if _HAS_CV2 else 0
-        # 重新打开获取 fps（cap 已 release）
+        # 重新打开获取 fps（cap 已在 try 块中 release）
+        fps = 0
         try:
             cap2 = cv2.VideoCapture(path)
             fps = cap2.get(cv2.CAP_PROP_FPS)

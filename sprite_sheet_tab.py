@@ -925,6 +925,14 @@ class SpriteSheetTab(QWidget):
         self.size_combo_h.setCurrentText("1024")
         self.size_combo_h.setFixedWidth(120)
 
+        # 导出尺寸变化时刷新预览，让用户看到缩放后的实际效果
+        self._export_size_timer = QTimer(self)
+        self._export_size_timer.setSingleShot(True)
+        self._export_size_timer.setInterval(200)
+        self._export_size_timer.timeout.connect(self._do_export_size_refresh)
+        self.size_combo_w.currentTextChanged.connect(self._on_export_size_changed)
+        self.size_combo_h.currentTextChanged.connect(self._on_export_size_changed)
+
         self.chk_auto_grid = QCheckBox("自动排列（推荐）")
         self.chk_auto_grid.setChecked(True)
         self.chk_auto_grid.stateChanged.connect(self._on_grid_mode_change)
@@ -1136,6 +1144,8 @@ class SpriteSheetTab(QWidget):
         self.list_widget.clear()
         self.sheet_label.set_sheet(None, 1, 1, 0)
         self.gif_label.clear()
+        self.sheet_title.setText("精灵图预览")
+        self.gif_title.setText("GIF预览")
         # 清空后重置行列 spin 的最大值和值
         self.spin_cols.blockSignals(True)
         self.spin_rows.blockSignals(True)
@@ -1542,20 +1552,81 @@ class SpriteSheetTab(QWidget):
         self.sheet_rgba = sheet
         self._update_sheet_preview()
 
+    # ---------------- export size helpers ----------------
+    def _get_export_size(self) -> Tuple[int, int]:
+        """获取当前导出尺寸设置"""
+        try:
+            out_w = int(self.size_combo_w.currentText())
+        except Exception:
+            out_w = 1024
+        try:
+            out_h = int(self.size_combo_h.currentText())
+        except Exception:
+            out_h = 1024
+        return max(1, out_w), max(1, out_h)
+
+    def _on_export_size_changed(self, _text=None):
+        """导出尺寸下拉框变化时，防抖延迟刷新预览"""
+        # 可编辑ComboBox每次按键都会触发，用防抖避免频繁resize卡顿
+        self._export_size_timer.start()
+
+    def _do_export_size_refresh(self):
+        """防抖定时器到期后，真正执行预览刷新"""
+        # 验证输入是否为有效正整数，无效则跳过刷新
+        try:
+            w = int(self.size_combo_w.currentText())
+            h = int(self.size_combo_h.currentText())
+            if w <= 0 or h <= 0:
+                return
+        except (ValueError, TypeError):
+            return
+        self._update_sheet_preview()
+        self._update_gif_preview()
+
+    def _update_preview_titles(self):
+        """根据当前导出尺寸更新预览区标题"""
+        out_w, out_h = self._get_export_size()
+        if self.sheet_rgba is not None:
+            orig_w, orig_h = self.sheet_rgba.size
+            self.sheet_title.setText(f"精灵图预览（导出: {out_w}×{out_h}，原始: {orig_w}×{orig_h}）")
+        else:
+            self.sheet_title.setText("精灵图预览")
+
+        if self.frames_rgba:
+            cols = max(1, self.sheet_cols)
+            rows = max(1, self.sheet_rows)
+            cell_w = out_w // cols
+            cell_h = out_h // rows
+            self.gif_title.setText(f"GIF预览（单帧导出尺寸: {cell_w}×{cell_h}）")
+        else:
+            self.gif_title.setText("GIF预览")
+
     # ---------------- previews ----------------
     def _update_sheet_preview(self):
         if self.sheet_rgba is None:
             self.sheet_label.set_sheet(None, 1, 1, 0)
             return
-        pix = pil_to_qpixmap(self.sheet_rgba)
+        # 按导出尺寸缩放后再预览，让用户看到实际导出效果
+        out_w, out_h = self._get_export_size()
+        preview_img = self.sheet_rgba.resize((out_w, out_h), resample=Image.LANCZOS)
+        pix = pil_to_qpixmap(preview_img)
         self.sheet_label.set_sheet(pix, self.sheet_cols, self.sheet_rows, len(self.frames_rgba))
+        self._update_preview_titles()
 
     def _update_gif_preview(self):
         if not self.frames_rgba:
             self.gif_label.clear()
             return
         i = self.preview_index % len(self.frames_rgba)
-        pix = pil_to_qpixmap(self.frames_rgba[i]).scaled(
+        # 根据导出尺寸计算每帧的实际像素大小
+        out_w, out_h = self._get_export_size()
+        cols = max(1, self.sheet_cols)
+        rows = max(1, self.sheet_rows)
+        cell_w = max(1, out_w // cols)
+        cell_h = max(1, out_h // rows)
+        # 先将帧缩放到导出后的实际单帧尺寸，再缩放到预览区大小
+        frame_resized = self.frames_rgba[i].resize((cell_w, cell_h), resample=Image.LANCZOS)
+        pix = pil_to_qpixmap(frame_resized).scaled(
             self.gif_label.width(),
             self.gif_label.height(),
             Qt.KeepAspectRatio,
@@ -1695,14 +1766,7 @@ class SpriteSheetTab(QWidget):
     def export_sheet(self):
         if self.sheet_rgba is None:
             return
-        try:
-            out_w = int(self.size_combo_w.currentText())
-        except Exception:
-            out_w = 1024
-        try:
-            out_h = int(self.size_combo_h.currentText())
-        except Exception:
-            out_h = 1024
+        out_w, out_h = self._get_export_size()
 
         out_img = self.sheet_rgba.resize((out_w, out_h), resample=Image.LANCZOS)
 

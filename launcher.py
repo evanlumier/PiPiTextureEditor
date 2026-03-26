@@ -7,7 +7,11 @@ launcher.py —— 轻量级启动器
 import sys
 import os
 import traceback
+import subprocess
 from datetime import datetime
+
+# ── exe 文件名白名单配置 ──
+_EXPECTED_EXE_NAME = "皮皮贴图修改器.exe"
 
 
 def _get_base_dir() -> str:
@@ -105,8 +109,103 @@ def _global_excepthook(exc_type, exc_value, exc_tb):
 sys.excepthook = _global_excepthook
 
 
+def _check_exe_name():
+    """
+    检查 exe 文件名是否被修改，如果被修改则弹窗提示并自动重命名后重启。
+    仅在打包环境（frozen）下生效，开发环境跳过。
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # 开发环境，不检查
+
+    exe_path = sys.executable
+    exe_name = os.path.basename(exe_path)
+
+    if exe_name == _EXPECTED_EXE_NAME:
+        return  # 文件名正确，放行
+
+    # ── 文件名被修改，弹窗提示 ──
+    msg = (
+        "由于iOA会对插件在线更新版本报风险项，"
+        "因此已联系8000加白名单为「皮皮贴图修改器」，"
+        "修改名字会造成插件无法使用，接下来将自动重命名。"
+    )
+
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            msg,
+            "皮皮贴图修改器 - 文件名异常",
+            0x30  # MB_ICONWARNING
+        )
+    except Exception:
+        pass
+
+    # ── 生成 bat 脚本：等待当前进程退出 → 重命名 → 重启 ──
+    exe_dir = os.path.dirname(exe_path)
+    new_path = os.path.join(exe_dir, _EXPECTED_EXE_NAME)
+
+    # 如果目标文件名已存在（比如旧版本残留），先删掉
+    bat_content = f'''@echo off
+chcp 65001 >nul
+echo 正在等待程序退出...
+:wait_loop
+tasklist /FI "PID eq {os.getpid()}" 2>nul | find /I "{os.getpid()}" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait_loop
+)
+echo 程序已退出，正在重命名...
+if exist "{new_path}" del /f "{new_path}"
+rename "{exe_path}" "{_EXPECTED_EXE_NAME}"
+if errorlevel 1 (
+    echo 重命名失败！
+    pause
+    exit /b 1
+)
+echo 重命名成功，正在重新启动...
+start "" "{new_path}"
+del "%~f0"
+'''
+
+    # 将 bat 写到 exe 同目录下（确保有权限）
+    bat_path = os.path.join(exe_dir, "_rename_fix.bat")
+    try:
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+
+        # 启动 bat 脚本（隐藏窗口）
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE
+        subprocess.Popen(
+            ["cmd.exe", "/c", bat_path],
+            startupinfo=startupinfo,
+            cwd=exe_dir,
+        )
+    except Exception as e:
+        # 如果 bat 方案失败，至少告诉用户手动改名
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"自动重命名失败：{e}\n\n"
+                f"请手动将文件重命名为：{_EXPECTED_EXE_NAME}",
+                "皮皮贴图修改器 - 重命名失败",
+                0x10  # MB_ICONERROR
+            )
+        except Exception:
+            pass
+
+    # 退出当前进程，让 bat 脚本完成重命名
+    sys.exit(0)
+
+
 def main():
     try:
+        # ── 检查 exe 文件名是否被篡改 ──
+        _check_exe_name()
+
         # ── 清理上次更新遗留的旧版本文件夹 ──
         try:
             from updater import cleanup_old_version
