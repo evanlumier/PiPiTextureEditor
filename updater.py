@@ -952,6 +952,8 @@ echo   此窗口将在 3 秒后自动关闭。
 echo ========================================
 timeout /t 3 /nobreak >nul
 
+:: 清理旧版本备份目录
+rmdir /s /q "{backup_dir}" >nul 2>&1
 :: 清理临时解压目录
 rmdir /s /q "{extract_dir}" >nul 2>&1
 :: 删除自身
@@ -967,6 +969,7 @@ for /d %%f in ("{backup_dir}\\*") do (
     move /y "%%f" "{app_dir}\\" >nul 2>&1
 )
 del /f /q "{lock_file}" >nul 2>&1
+rmdir /s /q "{backup_dir}" >nul 2>&1
 echo 回滚完成。正在重新启动旧版本...
 start "" "{os.path.join(app_dir, current_exe_name)}"
 timeout /t 3 /nobreak >nul
@@ -1030,18 +1033,26 @@ def recover_interrupted_update() -> bool:
     except Exception:
         lock_info = {}
 
-    # 尝试从备份中恢复
+    # 尝试从备份中恢复（覆盖可能损坏的文件）
     if os.path.exists(backup_dir) and os.listdir(backup_dir):
         _log.warning("发现备份目录，尝试恢复旧版本...")
         try:
             for item in os.listdir(backup_dir):
                 src = os.path.join(backup_dir, item)
                 dst = os.path.join(app_dir, item)
-                if not os.path.exists(dst):
-                    if os.path.isdir(src):
-                        shutil.copytree(src, dst)
-                    else:
-                        shutil.copy2(src, dst)
+                # 先删除目标（可能是更新中途写入的不完整文件）
+                try:
+                    if os.path.isdir(dst):
+                        shutil.rmtree(dst, ignore_errors=True)
+                    elif os.path.exists(dst):
+                        os.remove(dst)
+                except Exception:
+                    pass
+                # 从备份恢复
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
             _log.warning("旧版本恢复完成")
         except Exception as e:
             _log.error("恢复旧版本失败: %s", e)

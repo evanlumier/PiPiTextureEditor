@@ -182,6 +182,7 @@ del "%~f0"
             ["cmd.exe", "/c", bat_path],
             startupinfo=startupinfo,
             cwd=exe_dir,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception as e:
         # 如果 bat 方案失败，至少告诉用户手动改名

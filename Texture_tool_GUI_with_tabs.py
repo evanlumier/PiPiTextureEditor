@@ -1666,6 +1666,9 @@ class MainWindow(QMainWindow):
             self._do_update(info["download_url"])
         elif clicked == btn_skip:
             self._set_skipped_version(new_version)
+            # 清除缓存中的新版本信息，避免后续自动检查再次触发弹窗信号
+            from updater import _update_check_cache, _CACHE_NO_UPDATE
+            _update_check_cache["result"] = _CACHE_NO_UPDATE
 
     def _do_update(self, download_url: str):
         """执行下载和更新流程（下载阶段显示详细信息，安装阶段显示进度条）"""
