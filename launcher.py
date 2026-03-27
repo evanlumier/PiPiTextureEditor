@@ -206,6 +206,13 @@ def main():
         # ── 检查 exe 文件名是否被篡改 ──
         _check_exe_name()
 
+        # ── 检测上次更新是否中途中断，如果是则尝试恢复 ──
+        try:
+            from updater import recover_interrupted_update
+            recover_interrupted_update()
+        except Exception:
+            pass  # updater 模块不存在或恢复失败，不影响正常启动
+
         # ── 清理上次更新遗留的旧版本文件夹 ──
         try:
             from updater import cleanup_old_version

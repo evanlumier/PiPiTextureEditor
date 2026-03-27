@@ -2104,7 +2104,9 @@ class ImageViewerTab(QWidget):
             self._reposition_minimap()
 
         try:
-            self._pil_image = Image.open(filepath)
+            img = Image.open(filepath)
+            img.load()  # 强制加载数据并释放文件句柄
+            self._pil_image = img
         except Exception:
             pass
 

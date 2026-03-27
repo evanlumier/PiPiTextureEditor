@@ -181,6 +181,7 @@ def generate_growth_gray_from_sequence(
     invert: bool = False,
     force_mode: str = "",
     progress_callback=None,
+    cancel_flag=None,
 ) -> dict:
     """
     将帧迭代器（序列帧或视频）流式转换为生长灰度图。
@@ -265,6 +266,10 @@ def generate_growth_gray_from_sequence(
         processed += 1
         if progress_callback is not None:
             progress_callback(processed, N)
+
+        # 检查取消标志
+        if cancel_flag is not None and cancel_flag():
+            raise InterruptedError("用户取消了生成操作")
 
         # frame 和 presence 在下一轮循环时自动被 GC 回收
 

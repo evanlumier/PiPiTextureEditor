@@ -74,6 +74,7 @@ OLD_BACKUP_DIR_NAME = "_old_version_backup"
 _UPDATE_LOCK_FILE = "_update_in_progress.lock"
 
 # API 请求缓存（避免同一 IP 下多次请求触发 GitHub 限流）
+_CACHE_NO_UPDATE = "__no_update__"  # 哨兵值，表示已检查过且无更新
 _update_check_cache = {
     "result": None,
     "timestamp": 0,
@@ -510,9 +511,11 @@ def check_for_update(force: bool = False) -> dict | None:
     now = time.time()
     if not force and _update_check_cache["result"] is not None:
         if now - _update_check_cache["timestamp"] < _update_check_cache["ttl"]:
+            cached = _update_check_cache["result"]
             _log.debug("使用缓存的更新检查结果（%d 秒前）",
                        int(now - _update_check_cache["timestamp"]))
-            return _update_check_cache["result"]
+            # 哨兵值表示"已检查过且无更新"，返回 None
+            return None if cached == _CACHE_NO_UPDATE else cached
 
     data = None
 
@@ -532,7 +535,7 @@ def check_for_update(force: bool = False) -> dict | None:
 
     if data is None:
         # 缓存"无结果"状态，避免频繁重试
-        _update_check_cache["result"] = None
+        _update_check_cache["result"] = _CACHE_NO_UPDATE
         _update_check_cache["timestamp"] = now
         return None  # 所有镜像 × 所有轮次均失败
 
@@ -547,7 +550,7 @@ def check_for_update(force: bool = False) -> dict | None:
 
         if latest_ver <= current_ver:
             # 缓存"已是最新"结果
-            _update_check_cache["result"] = None
+            _update_check_cache["result"] = _CACHE_NO_UPDATE
             _update_check_cache["timestamp"] = now
             return None  # 已是最新版本
 
@@ -878,20 +881,6 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         bat_path = os.path.join(tempfile.gettempdir(), "ppeditor_update.bat")
         current_pid = os.getpid()
 
-        # 需要跳过的目录/文件
-        skip_items = [
-            OLD_BACKUP_DIR_NAME,
-            _UPDATE_LOCK_FILE,
-            "error_log.txt",
-            ".git",
-            "__pycache__",
-        ]
-
-        # 生成跳过条件的 bat 语法
-        skip_conditions = ""
-        for item in skip_items:
-            skip_conditions += f'    if "%%f"=="{item}" goto :skip_backup\n'
-
         # 生成 bat 脚本内容
         bat_content = f'''@echo off
 chcp 65001 >nul 2>&1
@@ -925,18 +914,16 @@ if exist "{backup_dir}" rmdir /s /q "{backup_dir}" >nul 2>&1
 mkdir "{backup_dir}" >nul 2>&1
 
 for %%f in ("{app_dir}\\*") do (
-{skip_conditions}    move /y "%%f" "{backup_dir}\\" >nul 2>&1
-    :skip_backup
+    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"=="{_UPDATE_LOCK_FILE}" if not "%%~nxf"=="error_log.txt" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
 )
 for /d %%f in ("{app_dir}\\*") do (
-    if "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" goto :skip_dir
-    if "%%~nxf"==".git" goto :skip_dir
-    if "%%~nxf"=="__pycache__" goto :skip_dir
-    move /y "%%f" "{backup_dir}\\" >nul 2>&1
-    :skip_dir
+    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
 )
 echo 备份完成。
 echo.
+
+:: 兜底清理：确保旧 _internal 目录被彻底删除（防止 move 失败导致残留）
+if exist "{app_dir}\\_internal" rmdir /s /q "{app_dir}\\_internal" >nul 2>&1
 
 :: 复制新文件
 echo [3/5] 安装新版本...

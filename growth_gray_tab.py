@@ -29,7 +29,7 @@ from typing import Optional, List
 import numpy as np
 from PIL import Image
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QRegularExpression, QTimer
+from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QRegularExpression, QTimer, QThread, Signal
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QCursor,
     QRegularExpressionValidator, QKeySequence, QShortcut,
@@ -726,6 +726,58 @@ class GrowthCanvas(QWidget):
             super().keyPressEvent(e)
 
 
+# ── 序列帧生成后台线程 ─────────────────────────────────────────────────
+class _SeqGenWorker(QThread):
+    """在后台线程中执行 generate_growth_gray_from_sequence，避免阻塞 UI。"""
+    progress = Signal(int, int)       # (current_frame, total_frames)
+    finished_ok = Signal(dict)        # 生成结果 dict
+    finished_err = Signal(str)        # 错误信息
+    cancelled = Signal()              # 用户取消
+
+    def __init__(self, frame_iter, frame_count, source_mode, presence_blur,
+                 hit_threshold, mask_threshold, invert, force_mode, parent=None):
+        super().__init__(parent)
+        self._frame_iter = frame_iter
+        self._frame_count = frame_count
+        self._source_mode = source_mode
+        self._presence_blur = presence_blur
+        self._hit_threshold = hit_threshold
+        self._mask_threshold = mask_threshold
+        self._invert = invert
+        self._force_mode = force_mode
+        self._cancelled = False
+
+    def cancel(self):
+        """请求取消生成。"""
+        self._cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def run(self):
+        try:
+            result = generate_growth_gray_from_sequence(
+                frame_iter=self._frame_iter,
+                frame_count=self._frame_count,
+                source_mode=self._source_mode,
+                presence_blur=self._presence_blur,
+                hit_threshold=self._hit_threshold,
+                mask_threshold=self._mask_threshold,
+                invert=self._invert,
+                force_mode=self._force_mode,
+                progress_callback=lambda cur, tot: self.progress.emit(cur, tot),
+                cancel_flag=lambda: self._cancelled,
+            )
+            if self._cancelled:
+                self.cancelled.emit()
+            else:
+                self.finished_ok.emit(result)
+        except InterruptedError:
+            self.cancelled.emit()
+        except Exception as ex:
+            self.finished_err.emit(str(ex))
+
+
 # ── 主 Tab ────────────────────────────────────────────────────────────
 class GrowthGrayTab(QWidget):
     """生长灰度图生成器 Tab"""
@@ -756,6 +808,7 @@ class GrowthGrayTab(QWidget):
         self._video_path: Optional[str] = None                # 视频文件路径
         self._video_frame_count: int = 0                      # 视频总帧数
         self._video_sample_interval: int = 1                  # 视频帧采样间隔
+        self._seq_gen_worker: Optional[_SeqGenWorker] = None  # 序列帧生成后台线程
 
         # ── 防抖 Timer（参数变化后延迟 600ms 自动重新生成）──────────────
         from PySide6.QtCore import QTimer
@@ -1248,6 +1301,14 @@ class GrowthGrayTab(QWidget):
             "padding:8px; border-radius:7px;"
         )
         sgg.addWidget(self.btn_generate_seq)
+
+        self.btn_cancel_seq = QPushButton("⏹  取消生成")
+        self.btn_cancel_seq.setStyleSheet(
+            "background:#f38ba8; color:#1e1e2e; font-weight:700;"
+            "padding:8px; border-radius:7px;"
+        )
+        self.btn_cancel_seq.setVisible(False)
+        sgg.addWidget(self.btn_cancel_seq)
 
         self.lbl_seq_status = QLabel("尚未生成")
         self.lbl_seq_status.setStyleSheet("color:#6c7086; font-size:10px;")
@@ -1884,6 +1945,7 @@ class GrowthGrayTab(QWidget):
 
         # 生成
         self.btn_generate_seq.clicked.connect(self._generate_from_sequence)
+        self.btn_cancel_seq.clicked.connect(self._cancel_seq_generation)
         self.btn_generate_seed.clicked.connect(self._generate_from_seed)
 
         # ── 参数变化自动重新生成（防抖 600ms）──
@@ -2403,6 +2465,10 @@ class GrowthGrayTab(QWidget):
 
     # ── 序列帧自动生成 ─────────────────────────────────────────────────
     def _generate_from_sequence(self):
+        # 如果已有后台线程在运行，忽略重复点击
+        if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
+            return
+
         # 支持三种来源：视频文件 / 序列帧文件路径 / 已加载的帧列表
         has_video = bool(self._video_path) and _HAS_CV2
         has_paths = bool(self._seq_file_paths)
@@ -2419,15 +2485,14 @@ class GrowthGrayTab(QWidget):
         mask_threshold = self.dspin_mask_thresh.value()
         invert = self.chk_invert.isChecked()
 
-        # ── 跨帧 auto 判定（预扫描采样帧）──
+        # ── 跨帧 auto 判定（预扫描采样帧，数据量小，主线程完成即可）──
         force_mode = ""
-        cross_triggered = False
         if source_mode == "auto":
             self.lbl_seq_status.setText("分析帧数据中…")
             QApplication.processEvents()
             sample_frames = self._sample_frames_for_auto_detect(16)
             if len(sample_frames) >= 2:
-                force_mode, cross_triggered = cross_frame_auto_detect(sample_frames)
+                force_mode, _ = cross_frame_auto_detect(sample_frames)
             del sample_frames  # 释放采样帧
 
         # ── 构建帧迭代器和帧数 ──
@@ -2436,41 +2501,56 @@ class GrowthGrayTab(QWidget):
             self._video_sample_interval = sample_interval
             frame_count = self._video_frame_count // max(sample_interval, 1)
             frame_iter = self._iter_frames_from_video(self._video_path, sample_interval)
-            source_label = f"视频（每{sample_interval}帧取1帧）" if sample_interval > 1 else "视频"
         elif has_paths:
             frame_count = len(self._seq_file_paths)
             frame_iter = self._iter_frames_from_paths(self._seq_file_paths)
-            source_label = "序列帧"
         else:
-            # 兼容旧的已加载帧列表（理论上不再会走到这里）
             frame_count = len(self.sequence_frames)
             frame_iter = iter(self.sequence_frames)
-            source_label = "序列帧"
 
-        self.lbl_seq_status.setText(f"流式计算中（{frame_count} 帧），请稍候…")
-        QApplication.processEvents()
+        # ── 切换 UI 为"生成中"状态 ──
+        self.btn_generate_seq.setEnabled(False)
+        self.btn_cancel_seq.setVisible(True)
+        self.lbl_seq_status.setText(f"后台计算中（{frame_count} 帧），请稍候…")
 
-        def _progress_cb(current, total):
-            if current % max(1, total // 20) == 0:  # 每 5% 更新一次
-                self.lbl_seq_status.setText(f"计算中… {current}/{total} 帧")
-                QApplication.processEvents()
+        # ── 启动后台线程 ──
+        worker = _SeqGenWorker(
+            frame_iter=frame_iter,
+            frame_count=frame_count,
+            source_mode=source_mode,
+            presence_blur=presence_blur,
+            hit_threshold=hit_threshold,
+            mask_threshold=mask_threshold,
+            invert=invert,
+            force_mode=force_mode,
+            parent=self,
+        )
+        worker.progress.connect(self._on_seq_gen_progress)
+        worker.finished_ok.connect(self._on_seq_gen_finished)
+        worker.finished_err.connect(self._on_seq_gen_error)
+        worker.cancelled.connect(self._on_seq_gen_cancelled)
+        self._seq_gen_worker = worker
+        worker.start()
 
-        try:
-            result = generate_growth_gray_from_sequence(
-                frame_iter=frame_iter,
-                frame_count=frame_count,
-                source_mode=source_mode,
-                presence_blur=presence_blur,
-                hit_threshold=hit_threshold,
-                mask_threshold=mask_threshold,
-                invert=invert,
-                force_mode=force_mode,
-                progress_callback=_progress_cb,
-            )
-        except Exception as ex:
-            QMessageBox.warning(self, "生成失败", str(ex))
-            self.lbl_seq_status.setText("生成失败")
-            return
+    def _cancel_seq_generation(self):
+        """用户点击取消按钮。"""
+        if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
+            self._seq_gen_worker.cancel()
+            self.lbl_seq_status.setText("正在取消…")
+            self.btn_cancel_seq.setEnabled(False)
+
+    def _on_seq_gen_progress(self, current: int, total: int):
+        """后台线程进度回调（通过信号在主线程执行）。"""
+        if current % max(1, total // 20) == 0:  # 每 5% 更新一次
+            self.lbl_seq_status.setText(f"计算中… {current}/{total} 帧")
+
+    def _on_seq_gen_finished(self, result: dict):
+        """后台线程生成完成回调。"""
+        # 恢复 UI 状态
+        self.btn_generate_seq.setEnabled(True)
+        self.btn_cancel_seq.setVisible(False)
+        self.btn_cancel_seq.setEnabled(True)
+        self._seq_gen_worker = None
 
         # 写入核心数据
         self.gray_map = result["gray_map"]
@@ -2505,6 +2585,9 @@ class GrowthGrayTab(QWidget):
         actual_mode = result["actual_mode"]
         alpha_lum_diff = result.get("alpha_lum_diff", 0.0)
         cross_frame_triggered = result.get("cross_frame_triggered", False)
+        hit_threshold = self.dspin_hit.value()
+        mask_threshold = self.dspin_mask_thresh.value()
+        invert = self.chk_invert.isChecked()
 
         # ── 更新"内容识别方式"状态标签 ──
         is_auto = (self.combo_source_mode.currentIndex() == 0)
@@ -2555,6 +2638,23 @@ class GrowthGrayTab(QWidget):
         )
         self._seq_generated = True  # 标记已生成过，后续参数变化可自动刷新
 
+    def _on_seq_gen_error(self, err_msg: str):
+        """后台线程生成失败回调。"""
+        self.btn_generate_seq.setEnabled(True)
+        self.btn_cancel_seq.setVisible(False)
+        self.btn_cancel_seq.setEnabled(True)
+        self._seq_gen_worker = None
+        QMessageBox.warning(self, "生成失败", err_msg)
+        self.lbl_seq_status.setText("生成失败")
+
+    def _on_seq_gen_cancelled(self):
+        """后台线程被取消回调。"""
+        self.btn_generate_seq.setEnabled(True)
+        self.btn_cancel_seq.setVisible(False)
+        self.btn_cancel_seq.setEnabled(True)
+        self._seq_gen_worker = None
+        self.lbl_seq_status.setText("已取消生成")
+
     def _schedule_auto_regen(self):
         """参数变化时启动防抖 Timer，600ms 后自动重新生成（仅在已生成过的情况下触发）。"""
         if self._seq_generated and (self.sequence_frames or self._seq_file_paths or self._video_path):
@@ -2563,6 +2663,14 @@ class GrowthGrayTab(QWidget):
     def _auto_regen_if_ready(self):
         """防抖 Timer 触发：自动重新生成序列帧灰度图。"""
         if self._seq_generated and (self.sequence_frames or self._seq_file_paths or self._video_path):
+            # 如果后台线程正在运行，先取消旧的
+            if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
+                self._seq_gen_worker.cancel()
+                self._seq_gen_worker.wait()
+                self._seq_gen_worker = None
+                self.btn_generate_seq.setEnabled(True)
+                self.btn_cancel_seq.setVisible(False)
+                self.btn_cancel_seq.setEnabled(True)
             self._generate_from_sequence()
 
     # ── Mask 生成 ──────────────────────────────────────────────────────
@@ -2987,6 +3095,34 @@ class GrowthGrayTab(QWidget):
         h = _parse(self.export_size_h.currentText(), orig_h)
         return w, h
 
+    # ── 导出目录记忆 ─────────────────────────────────────────────────
+    def _get_export_dir_cache_path(self) -> str:
+        appdata = os.getenv("APPDATA") or ""
+        folder = os.path.join(appdata, "GUITextureEditor")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, "growth_gray_last_export_dir.txt")
+
+    def _load_last_export_dir(self) -> str:
+        try:
+            with open(self._get_export_dir_cache_path(), "r", encoding="utf-8") as f:
+                d = f.read().strip()
+                if d and os.path.isdir(d):
+                    return d
+        except Exception:
+            pass
+        if self._src_path and os.path.isfile(self._src_path):
+            return os.path.dirname(self._src_path)
+        elif self._src_path and os.path.isdir(self._src_path):
+            return self._src_path
+        return ""
+
+    def _save_last_export_dir(self, path: str):
+        try:
+            with open(self._get_export_dir_cache_path(), "w", encoding="utf-8") as f:
+                f.write(os.path.dirname(path))
+        except Exception:
+            pass
+
     def _export_gray(self):
         if self.gray_map is None or self.source_image is None:
             QMessageBox.information(self, "提示", "请先导入图像并绘制路径。")
@@ -3001,13 +3137,8 @@ class GrowthGrayTab(QWidget):
         else:
             default_name = "Growth.png"
 
-        # 确定默认目录
-        if self._src_path and os.path.isfile(self._src_path):
-            default_dir = os.path.dirname(self._src_path)
-        elif self._src_path and os.path.isdir(self._src_path):
-            default_dir = self._src_path
-        else:
-            default_dir = ""
+        # 确定默认目录（优先使用上次导出目录）
+        default_dir = self._load_last_export_dir()
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "导出灰度图",
@@ -3026,6 +3157,7 @@ class GrowthGrayTab(QWidget):
             if export_w != orig_w or export_h != orig_h:
                 out_img = out_img.resize((export_w, export_h), Image.BILINEAR)
             out_img.save(save_path)
+            self._save_last_export_dir(save_path)
             size_info = f"{export_w}×{export_h}"
             self.lbl_export_info.setText(f"已导出：{size_info}\n{os.path.basename(save_path)}")
             QMessageBox.information(self, "导出成功", f"尺寸：{size_info}\n已保存到：\n{save_path}")
@@ -3049,12 +3181,7 @@ class GrowthGrayTab(QWidget):
         else:
             default_name = "Growth_Noise.png"
 
-        if self._src_path and os.path.isfile(self._src_path):
-            default_dir = os.path.dirname(self._src_path)
-        elif self._src_path and os.path.isdir(self._src_path):
-            default_dir = self._src_path
-        else:
-            default_dir = ""
+        default_dir = self._load_last_export_dir()
 
         save_path, _ = QFileDialog.getSaveFileName(
             self, "导出叠加噪波后的灰度图",
@@ -3074,6 +3201,7 @@ class GrowthGrayTab(QWidget):
                 out_img = out_img.resize((export_w, export_h), Image.BILINEAR)
             out_img.save(save_path)
             size_info = f"{export_w}×{export_h}"
+            self._save_last_export_dir(save_path)
             self.lbl_export_info.setText(f"已导出（含噪波）：{size_info}\n{os.path.basename(save_path)}")
             QMessageBox.information(self, "导出成功", f"尺寸：{size_info}\n已保存到：\n{save_path}")
         except Exception as ex:

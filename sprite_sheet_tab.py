@@ -1651,6 +1651,21 @@ class SpriteSheetTab(QWidget):
         super().resizeEvent(event)
         self._update_sheet_preview()
         self._update_gif_preview()
+
+    # ---------- tab 切换时暂停/恢复 GIF 预览 timer ----------
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 仅在有帧数据且 timer 之前是活跃状态时恢复
+        if self.frames_rgba and getattr(self, '_timer_was_active', False):
+            self.timer.start()
+
+    def hideEvent(self, event):
+        # 记住 timer 当前状态，切回来时恢复
+        self._timer_was_active = self.timer.isActive()
+        if self._timer_was_active:
+            self.timer.stop()
+        super().hideEvent(event)
+
     # ---------------- naming ----------------
     def original_base(self) -> str:
         return "SpriteSheet"

@@ -582,15 +582,37 @@ class DropLabel(QLabel):
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            urls = event.mimeData().urls()
+            if urls:
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
+                    event.acceptProposedAction()
+                    self.setStyleSheet(
+                        "border:2px dashed #89b4fa;border-radius:10px;padding:20px;"
+                        "background:rgba(137,180,250,0.08);color:#89b4fa;font-size:13px;"
+                    )
+                    return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setStyleSheet(
+            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
+            "background:transparent;color:#6c7086;font-size:13px;"
+        )
 
     def dropEvent(self, event):
+        self.setStyleSheet(
+            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
+            "background:transparent;color:#6c7086;font-size:13px;"
+        )
         urls = event.mimeData().urls()
         if not urls:
             return
         path = urls[0].toLocalFile()
         if path:
-            self.on_drop_callback(path)
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
+                self.on_drop_callback(path)
 
 
 class CheckerLabel(QLabel):
@@ -1529,10 +1551,13 @@ class MainWindow(QMainWindow):
             update_found = Signal(dict)
             no_update = Signal()
             check_failed = Signal()
+            def __init__(self_t, parent, force_check):
+                super().__init__(parent)
+                self_t._force = force_check
             def run(self_t):
                 try:
                     from updater import check_for_update
-                    result = check_for_update()
+                    result = check_for_update(force=self_t._force)
                     if result:
                         self_t.update_found.emit(result)
                     else:
@@ -1540,7 +1565,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     self_t.check_failed.emit()
 
-        self._update_thread = _UpdateThread(self)
+        self._update_thread = _UpdateThread(self, force_check=manual)
         self._update_thread.update_found.connect(self._on_update_found)
         self._update_thread.no_update.connect(self._on_no_update)
         self._update_thread.check_failed.connect(self._on_check_failed)
@@ -1582,8 +1607,38 @@ class MainWindow(QMainWindow):
                     "无法连接到更新服务器，请检查网络后重试。"
                 )
 
+    def _get_skipped_version_path(self) -> str:
+        """获取跳过版本记录文件路径"""
+        appdata = os.getenv("APPDATA") or ""
+        folder = os.path.join(appdata, "GUITextureEditor")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, "skipped_version.txt")
+
+    def _get_skipped_version(self) -> str:
+        """读取用户选择跳过的版本号"""
+        try:
+            with open(self._get_skipped_version_path(), "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _set_skipped_version(self, version: str):
+        """保存用户选择跳过的版本号"""
+        try:
+            with open(self._get_skipped_version_path(), "w", encoding="utf-8") as f:
+                f.write(version)
+        except Exception:
+            pass
+
     def _on_update_found(self, info: dict):
         """收到新版本信息后弹窗提示用户"""
+        new_version = info.get("version", "")
+
+        # 自动检查时，如果用户已跳过此版本，则静默忽略
+        if not getattr(self, '_manual_update_check', False):
+            if new_version and new_version == self._get_skipped_version():
+                return
+
         # 关闭关于对话框（如果还开着）
         if getattr(self, '_about_dlg', None):
             self._about_dlg.accept()
@@ -1596,16 +1651,21 @@ class MainWindow(QMainWindow):
         msg.setWindowTitle("发现新版本")
         msg.setIcon(QMessageBox.Information)
         msg.setText(
-            f"发现新版本 v{info['version']}\n"
+            f"发现新版本 v{new_version}\n"
             f"当前版本 v{__version__}\n\n"
             f"更新内容：\n{changelog}"
         )
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        msg.button(QMessageBox.Yes).setText("立即更新")
-        msg.button(QMessageBox.No).setText("稍后提醒")
+        btn_update = msg.addButton("立即更新", QMessageBox.AcceptRole)
+        btn_skip = msg.addButton("跳过此版本", QMessageBox.RejectRole)
+        btn_later = msg.addButton("稍后提醒", QMessageBox.NoRole)
+        msg.setDefaultButton(btn_update)
 
-        if msg.exec() == QMessageBox.Yes:
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_update:
             self._do_update(info["download_url"])
+        elif clicked == btn_skip:
+            self._set_skipped_version(new_version)
 
     def _do_update(self, download_url: str):
         """执行下载和更新流程（下载阶段显示详细信息，安装阶段显示进度条）"""
@@ -1721,26 +1781,40 @@ class MainWindow(QMainWindow):
             progress.setLabelText(stage)
             QApplication.processEvents()
 
-        def on_finished_ok(new_exe_path):
-            """更新完成，在主线程中启动新版本并退出"""
+        def on_finished_ok(bat_path):
+            """更新完成，在主线程中启动 bat 脚本并退出"""
             progress.setValue(100)
             progress.setLabelText("更新完成，正在重启...")
             QApplication.processEvents()
-            # 在主线程中安全地启动新版本并退出
+            # apply_update 返回的是 bat 脚本路径，需要通过 cmd.exe /c 启动
             import subprocess
             from updater import get_app_dir
-            subprocess.Popen([new_exe_path], cwd=get_app_dir())
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE，隐藏 CMD 窗口
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                cwd=get_app_dir(),
+                startupinfo=startupinfo,
+            )
             QApplication.quit()
 
         def on_finished_err(err_msg):
             progress.close()
             if not self._stop_event.is_set():
-                QMessageBox.warning(
-                    self, "更新失败",
+                retry_msg = QMessageBox(self)
+                retry_msg.setWindowTitle("更新失败")
+                retry_msg.setIcon(QMessageBox.Warning)
+                retry_msg.setText(
                     f"更新时出错：\n{err_msg}\n\n"
-                    "程序将继续使用当前版本。\n"
-                    "你可以稍后手动从 GitHub Release 页面下载最新版本。"
+                    "程序将继续使用当前版本。"
                 )
+                btn_retry = retry_msg.addButton("重试", QMessageBox.AcceptRole)
+                btn_close = retry_msg.addButton("关闭", QMessageBox.RejectRole)
+                retry_msg.setDefaultButton(btn_retry)
+                retry_msg.exec()
+                if retry_msg.clickedButton() == btn_retry:
+                    self._do_update(download_url)
 
         def on_cancelled():
             """用户取消了下载，关闭进度条"""
@@ -2183,7 +2257,7 @@ class MainWindow(QMainWindow):
             try:
                 out = self.preview_img
                 if orig_ext in ("jpg", "jpeg"):
-                    bg = Image.new("RGB", out.size, (0, 0, 0))
+                    bg = Image.new("RGB", out.size, (255, 255, 255))
                     bg.paste(out, mask=out.split()[-1])
                     bg.save(target_path, quality=95)
                 else:
@@ -2211,7 +2285,7 @@ class MainWindow(QMainWindow):
         try:
             out = self.preview_img
             if fmt == "JPG":
-                bg = Image.new("RGB", out.size, (0, 0, 0))
+                bg = Image.new("RGB", out.size, (255, 255, 255))
                 bg.paste(out, mask=out.split()[-1])
                 bg.save(path, quality=95)
             else:
@@ -2235,9 +2309,20 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._reposition_bug_btn()
+        # 防抖：避免拖拽调整窗口大小时频繁重绘
+        if not hasattr(self, '_resize_timer'):
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.setInterval(50)
+            self._resize_timer.timeout.connect(self._on_resize_done)
+        if self.preview_img is not None:
+            self._resize_timer.start()
+
+    def _on_resize_done(self):
+        """防抖结束后执行一次预览刷新"""
         if self.preview_img is not None:
             self.update_preview()
-        self._reposition_bug_btn()
 
     def showEvent(self, event):
         super().showEvent(event)

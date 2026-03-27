@@ -205,7 +205,13 @@ class DropRefWidget(QWidget):
         self._reset_style()
         urls = e.mimeData().urls()
         if urls:
-            self._load(urls[0].toLocalFile())
+            path = urls[0].toLocalFile()
+            _SUPPORTED = {'.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'}
+            if os.path.splitext(path)[1].lower() not in _SUPPORTED:
+                QMessageBox.information(self, "提示",
+                    "不支持的文件格式。\n支持格式：PNG、JPG、JPEG、TGA、BMP、WEBP")
+                return
+            self._load(path)
 
     # ── 点击导入 ──────────────────────────────────────────────────────
     def mousePressEvent(self, e):
