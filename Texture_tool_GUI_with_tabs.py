@@ -1796,6 +1796,7 @@ class MainWindow(QMainWindow):
                 ["cmd.exe", "/c", bat_path],
                 cwd=get_app_dir(),
                 startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             QApplication.quit()
 

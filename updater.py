@@ -882,8 +882,9 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         current_pid = os.getpid()
 
         # 生成 bat 脚本内容
+        # 注意：bat 文件用 GBK 编码写入，cmd.exe 默认代码页就是 GBK(936)，
+        # 不要使用 chcp 65001 切换到 UTF-8，否则中文路径会乱码导致所有文件操作失败！
         bat_content = f'''@echo off
-chcp 65001 >nul 2>&1
 title 皮皮贴图修改器 - 正在更新...
 echo ========================================
 echo   皮皮贴图修改器 - 自动更新
