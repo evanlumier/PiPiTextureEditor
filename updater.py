@@ -534,10 +534,8 @@ def check_for_update(force: bool = False) -> dict | None:
             time.sleep(_RETRY_DELAY)
 
     if data is None:
-        # 缓存"无结果"状态，避免频繁重试
-        _update_check_cache["result"] = _CACHE_NO_UPDATE
-        _update_check_cache["timestamp"] = now
-        return None  # 所有镜像 × 所有轮次均失败
+        # API 全部失败，不缓存为"无更新"，而是抛出异常让调用方区分
+        raise ConnectionError("所有 API 镜像均无法连接")
 
     # ── 解析版本信息 ──
     try:

@@ -146,8 +146,9 @@ def _check_exe_name():
     new_path = os.path.join(exe_dir, _EXPECTED_EXE_NAME)
 
     # 如果目标文件名已存在（比如旧版本残留），先删掉
+    # 注意：bat 文件用 GBK 编码写入，cmd.exe 默认代码页就是 GBK(936)，
+    # 不要使用 chcp 65001 切换到 UTF-8，否则中文路径/文件名会乱码导致操作失败！
     bat_content = f'''@echo off
-chcp 65001 >nul
 echo 正在等待程序退出...
 :wait_loop
 tasklist /FI "PID eq {os.getpid()}" 2>nul | find /I "{os.getpid()}" >nul
@@ -171,7 +172,7 @@ del "%~f0"
     # 将 bat 写到 exe 同目录下（确保有权限）
     bat_path = os.path.join(exe_dir, "_rename_fix.bat")
     try:
-        with open(bat_path, "w", encoding="utf-8") as f:
+        with open(bat_path, "w", encoding="gbk", errors="replace") as f:
             f.write(bat_content)
 
         # 启动 bat 脚本（隐藏窗口）

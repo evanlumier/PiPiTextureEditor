@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageEnhance, ImageOps
 
-from PySide6.QtCore import Qt, QRect, QPoint, QRegularExpression, QSize, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QRegularExpression, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QPixmap,
     QImage,
@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QSpinBox,
     QTabWidget,
+    QColorDialog,
     QTabBar,
     QStyleOptionTab,
     QStyle,
@@ -615,16 +616,101 @@ class DropLabel(QLabel):
                 self.on_drop_callback(path)
 
 
-class CheckerLabel(QLabel):
-    """带棋盘格透明背景的预览Label，hover时显示图片边界线"""
+class CheckerLabel(QWidget):
+    """带棋盘格透明背景的预览控件，支持滚轮缩放、右键拖拽平移、拖拽/点击导入"""
     def __init__(self, cell=12, color1=None, color2=None, parent=None):
         super().__init__(parent)
         self.cell = cell
         self.color1 = color1 or QColor(42, 42, 58)
         self.color2 = color2 or QColor(30, 30, 46)
         self._hovered = False
+        self._drag_hovering = False  # 拖拽悬停状态
+        self._on_drop_callback = None  # 拖拽/点击导入回调
+        self._parent_window = None  # 用于弹出文件对话框
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
 
+        # ── 缩放 & 平移状态 ──
+        self._source_pix: Optional[QPixmap] = None  # 原始 pixmap
+        self._scale: float = 1.0       # 当前缩放倍率
+        self._offset = QPointF(0, 0)   # 图片左上角在控件中的偏移
+        self._fit_done: bool = False    # 是否已执行过自适应
+
+        # ── 右键拖拽 ──
+        self._dragging: bool = False
+        self._last_mouse = QPointF()
+
+    # ── 兼容 QLabel 接口 ──────────────────────────────────────────────
+    def setPixmap(self, pix: QPixmap):
+        """设置要显示的 pixmap，仅首次或图片尺寸变化时自动适配窗口"""
+        old = self._source_pix
+        self._source_pix = pix
+        # 仅在首次设置或图片尺寸发生变化时才重置缩放
+        if old is None or old.isNull() or old.size() != pix.size():
+            self._fit_to_view()
+        self.update()
+
+    def pixmap(self) -> Optional[QPixmap]:
+        return self._source_pix
+
+    def clear(self):
+        self._source_pix = None
+        self._scale = 1.0
+        self._offset = QPointF(0, 0)
+        self._fit_done = False
+        self.update()
+
+    def setAlignment(self, *args):
+        pass  # 兼容旧调用，不需要实际处理
+
+    # ── 自适应窗口 ──────────────────────────────────────────────────
+    def _fit_to_view(self):
+        """让图片完整显示在控件中（适配窗口）"""
+        pm = self._source_pix
+        if pm is None or pm.isNull():
+            return
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        pw, ph = pm.width(), pm.height()
+        if pw <= 0 or ph <= 0:
+            return
+        self._scale = min(w / pw, h / ph)
+        # 居中
+        disp_w = pw * self._scale
+        disp_h = ph * self._scale
+        self._offset = QPointF((w - disp_w) / 2, (h - disp_h) / 2)
+        self._fit_done = True
+
+    def _clamp_offset(self):
+        """限制图片不能完全拖出预览框（至少保留 20% 可见）"""
+        pm = self._source_pix
+        if pm is None or pm.isNull():
+            return
+        pw = pm.width() * self._scale
+        ph = pm.height() * self._scale
+        w, h = self.width(), self.height()
+        # 至少保留 20% 的图片在可视区域内
+        margin_x = pw * 0.2
+        margin_y = ph * 0.2
+        min_x = -(pw - margin_x)
+        max_x = w - margin_x
+        min_y = -(ph - margin_y)
+        max_y = h - margin_y
+        ox = max(min_x, min(max_x, self._offset.x()))
+        oy = max(min_y, min(max_y, self._offset.y()))
+        self._offset = QPointF(ox, oy)
+
+    def _pixmap_rect(self):
+        """计算当前 pixmap 在控件中的显示矩形"""
+        pm = self._source_pix
+        if pm is None or pm.isNull():
+            return None
+        pw = pm.width() * self._scale
+        ph = pm.height() * self._scale
+        return QRectF(self._offset.x(), self._offset.y(), pw, ph)
+
+    # ── 鼠标事件 ──────────────────────────────────────────────────────
     def enterEvent(self, event):
         self._hovered = True
         self.update()
@@ -632,47 +718,199 @@ class CheckerLabel(QLabel):
 
     def leaveEvent(self, event):
         self._hovered = False
+        if not self._dragging:
+            self.setCursor(Qt.ArrowCursor)
         self.update()
         super().leaveEvent(event)
 
-    def _pixmap_rect(self):
-        """计算当前pixmap在label中居中显示的实际矩形区域"""
-        pm = self.pixmap()
-        if pm is None or pm.isNull():
-            return None
-        # label的内容区域（去除margin/border）
-        cr = self.contentsRect()
-        # pixmap实际尺寸
-        pw, ph = pm.width(), pm.height()
-        # 居中偏移
-        x = cr.x() + (cr.width() - pw) // 2
-        y = cr.y() + (cr.height() - ph) // 2
-        return QRect(x, y, pw, ph)
+    def mousePressEvent(self, event):
+        # 右键拖拽平移
+        if event.button() == Qt.RightButton and self._source_pix is not None:
+            self._dragging = True
+            self._last_mouse = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        # 左键点击导入（仅在没有图片时）
+        if event.button() == Qt.LeftButton and self._on_drop_callback is not None:
+            if self._source_pix is None or self._source_pix.isNull():
+                parent = self._parent_window or self
+                path, _ = QFileDialog.getOpenFileName(
+                    parent, "选择图片", "", "Images (*.png *.jpg *.jpeg *.tga *.bmp *.webp)"
+                )
+                if path:
+                    self._on_drop_callback(path)
+                return
+        super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            delta = event.position() - self._last_mouse
+            self._offset = QPointF(self._offset.x() + delta.x(),
+                                   self._offset.y() + delta.y())
+            self._clamp_offset()
+            self._last_mouse = event.position()
+            self.update()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton and self._dragging:
+            self._dragging = False
+            self.setCursor(Qt.ArrowCursor)
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        """滚轮缩放，以鼠标位置为缩放中心"""
+        pm = self._source_pix
+        if pm is None or pm.isNull():
+            return
+        pos = event.position()
+        old_scale = self._scale
+        delta = event.angleDelta().y()
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        new_scale = max(0.02, min(old_scale * factor, 30.0))
+        # 以鼠标位置为缩放中心
+        self._offset = QPointF(
+            pos.x() - (pos.x() - self._offset.x()) * new_scale / old_scale,
+            pos.y() - (pos.y() - self._offset.y()) * new_scale / old_scale,
+        )
+        self._scale = new_scale
+        self._clamp_offset()
+        self.update()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        """双击左键适配窗口"""
+        if event.button() == Qt.LeftButton and self._source_pix is not None:
+            self._fit_to_view()
+            self.update()
+
+    # ── 拖拽导入 ──────────────────────────────────────────────────────
+    def dragEnterEvent(self, event):
+        if self._on_drop_callback is not None and event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls:
+                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
+                if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
+                    event.acceptProposedAction()
+                    self._drag_hovering = True
+                    self.update()
+                    return
+        event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._drag_hovering = False
+        self.update()
+
+    def dropEvent(self, event):
+        self._drag_hovering = False
+        self.update()
+        if self._on_drop_callback is None:
+            return
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        path = urls[0].toLocalFile()
+        if path:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
+                self._on_drop_callback(path)
+
+    def resizeEvent(self, event):
+        old_size = event.oldSize()
+        new_size = event.size()
+        super().resizeEvent(event)
+        # 窗口大小变化时，按比例调整偏移量以保持视觉中心不变
+        if self._source_pix is not None and not self._source_pix.isNull():
+            if old_size.width() > 0 and old_size.height() > 0:
+                # 计算旧视口中心对应的图片坐标，在新视口中保持该点居中
+                old_cx = old_size.width() / 2.0
+                old_cy = old_size.height() / 2.0
+                new_cx = new_size.width() / 2.0
+                new_cy = new_size.height() / 2.0
+                self._offset = QPointF(
+                    self._offset.x() + (new_cx - old_cx),
+                    self._offset.y() + (new_cy - old_cy),
+                )
+                self._clamp_offset()
+            else:
+                self._fit_to_view()
+
+    # ── 绘制 ──────────────────────────────────────────────────────────
     def paintEvent(self, event):
-        painter = QPainter(self)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        # 圆角裁剪（配合 stylesheet 的 border-radius）
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), 10, 10)
+        p.setClipPath(path)
+
+        # 棋盘格背景
         cell = self.cell
         cols = self.width() // cell + 1
         rows = self.height() // cell + 1
         for r in range(rows):
             for c in range(cols):
                 color = self.color1 if (r + c) % 2 == 0 else self.color2
-                painter.fillRect(c * cell, r * cell, cell, cell, color)
-        painter.end()
-        super().paintEvent(event)
+                p.fillRect(c * cell, r * cell, cell, cell, color)
 
-        # hover时绘制图片边界指引线
-        if self._hovered:
+        pm = self._source_pix
+        has_image = pm is not None and not pm.isNull()
+
+        # 绘制图片
+        if has_image:
             pix_rect = self._pixmap_rect()
             if pix_rect:
-                p = QPainter(self)
+                p.drawPixmap(pix_rect, pm, QRectF(0, 0, pm.width(), pm.height()))
+
+        # 没有图片时显示拖拽提示
+        if not has_image and self._on_drop_callback is not None:
+            p.setRenderHint(QPainter.Antialiasing)
+            # 拖拽悬停时高亮边框
+            if self._drag_hovering:
+                border_pen = QPen(QColor(137, 180, 250))  # #89b4fa
+                border_pen.setWidth(2)
+                border_pen.setStyle(Qt.DashLine)
+                p.setPen(border_pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 10, 10)
+                p.setPen(QColor(137, 180, 250))
+            else:
+                # 虚线边框
+                border_pen = QPen(QColor(69, 71, 90))  # #45475a
+                border_pen.setWidth(2)
+                border_pen.setStyle(Qt.DashLine)
+                p.setPen(border_pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 10, 10)
+                p.setPen(QColor(108, 112, 134))  # #6c7086
+            font = p.font()
+            font.setPixelSize(14)
+            p.setFont(font)
+            p.drawText(self.rect(), Qt.AlignCenter, "拖拽图片到此处导入\n或点击此区域选择文件")
+            # 有提示时显示手型光标
+            self.setCursor(Qt.PointingHandCursor)
+        elif not has_image:
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            # 有图片时恢复默认光标
+            if not self._dragging:
+                self.setCursor(Qt.ArrowCursor)
+
+        # hover 时绘制图片边界指引线
+        if self._hovered and has_image:
+            pix_rect = self._pixmap_rect()
+            if pix_rect:
                 p.setRenderHint(QPainter.Antialiasing, False)
-                border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a — 与crop一致的边界线颜色
+                border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a
                 border_pen.setWidth(1)
                 p.setPen(border_pen)
                 p.setBrush(Qt.NoBrush)
-                p.drawRect(pix_rect)
-                p.end()
+                p.drawRect(pix_rect.toRect())
+
+        p.end()
 
 
 # =========================
@@ -1065,11 +1303,15 @@ class MainWindow(QMainWindow):
         self.master_color: Optional[Image.Image] = None  # 当前基础（裁切后会替换为裁切结果）
 
         self.is_bw: bool = False
-        self.has_black_bg: bool = False
+        self.has_unmult: bool = False
+        self.custom_bg_color: Optional[Tuple[int, int, int]] = None
         self.target_size: Optional[Tuple[int, int]] = None
 
         self.working_img: Optional[Image.Image] = None
-        self.preview_img: Optional[Image.Image] = None
+        self._preview_thumb: Optional[Image.Image] = None  # 预览用缩略图
+        self._preview_dirty: bool = True  # 标记全尺寸预览图是否需要重新生成
+        self._preview_full_cache: Optional[Image.Image] = None  # 全尺寸预览图缓存
+        self._PREVIEW_MAX = 1024  # 预览缩略图最大边长
 
         self.output_basename: Optional[str] = None
 
@@ -1142,15 +1384,14 @@ class MainWindow(QMainWindow):
         image_viewer_tab.transfer_to_texture.connect(self._on_transfer_from_viewer)
         # Left
         left_layout = QVBoxLayout()
-        self.drop_area = DropLabel(self.load_image)
-        self.drop_area._parent_window = self
         self.preview_label = CheckerLabel(cell=12)
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet("border-radius:10px; border:1px solid #383850;")
         self.preview_label.setMinimumSize(680, 560)
+        self.preview_label._on_drop_callback = self.load_image
+        self.preview_label._parent_window = self
 
-        left_layout.addWidget(self.drop_area, 1)
-        left_layout.addWidget(self.preview_label, 6)
+        left_layout.addWidget(self.preview_label, 1)
 
         # Right
         right_layout = QVBoxLayout()
@@ -1200,19 +1441,35 @@ class MainWindow(QMainWindow):
         bw_row.addWidget(btn_bw, 4)
         bw_row.addWidget(btn_reset_bw, 1)
 
-        # 添加黑底 + 重置（80%/20%）
-        black_bg_row = QHBoxLayout()
-        btn_black_bg = QPushButton("添加黑底")
-        btn_black_bg.setMinimumHeight(34)
-        btn_black_bg.setStyleSheet("text-align:center;")
-        btn_black_bg.clicked.connect(self.apply_black_bg)
+        # 添加自定义底色 + 重置（80%/20%）
+        custom_bg_row = QHBoxLayout()
+        btn_custom_bg = QPushButton("添加自定义底色")
+        btn_custom_bg.setMinimumHeight(34)
+        btn_custom_bg.setStyleSheet("text-align:center;")
+        btn_custom_bg.setMinimumWidth(340)
+        btn_custom_bg.clicked.connect(self.apply_custom_bg_color)
 
-        btn_reset_black_bg = QPushButton("重置")
-        btn_reset_black_bg.setMinimumHeight(34)
-        btn_reset_black_bg.clicked.connect(self.reset_black_bg)
+        btn_reset_custom_bg = QPushButton("重置")
+        btn_reset_custom_bg.setMinimumHeight(34)
+        btn_reset_custom_bg.clicked.connect(self.reset_custom_bg)
 
-        black_bg_row.addWidget(btn_black_bg, 4)
-        black_bg_row.addWidget(btn_reset_black_bg, 1)
+        custom_bg_row.addWidget(btn_custom_bg, 4)
+        custom_bg_row.addWidget(btn_reset_custom_bg, 1)
+
+        # 去除黑底(Unmult) + 重置（80%/20%）
+        unmult_row = QHBoxLayout()
+        btn_unmult = QPushButton("去除黑底")
+        btn_unmult.setMinimumHeight(34)
+        btn_unmult.setStyleSheet("text-align:center;")
+        btn_unmult.setMinimumWidth(340)
+        btn_unmult.clicked.connect(self.apply_unmult)
+
+        btn_reset_unmult = QPushButton("重置")
+        btn_reset_unmult.setMinimumHeight(34)
+        btn_reset_unmult.clicked.connect(self.reset_unmult)
+
+        unmult_row.addWidget(btn_unmult, 4)
+        unmult_row.addWidget(btn_reset_unmult, 1)
 
         # Brightness/Contrast
         adj_group = QGroupBox("亮度 / 对比度")
@@ -1390,7 +1647,8 @@ class MainWindow(QMainWindow):
 
         right_layout.addLayout(mask_gen_row)
         right_layout.addLayout(crop_row)
-        right_layout.addLayout(black_bg_row)
+        right_layout.addLayout(custom_bg_row)
+        right_layout.addLayout(unmult_row)
         right_layout.addLayout(bw_row)
         right_layout.addWidget(adj_group)
         right_layout.addWidget(resize_group)
@@ -1857,7 +2115,8 @@ class MainWindow(QMainWindow):
             self.master_color = img.copy()
 
             self.is_bw = False
-            self.has_black_bg = False
+            self.has_unmult = False
+            self.custom_bg_color = None
             self.target_size = None
             self.output_basename = None
 
@@ -1968,17 +2227,34 @@ class MainWindow(QMainWindow):
         self.master_color = self.source_color.copy()
         self.rebuild_working()
 
-    # ---------------- black bg ----------------
-    def apply_black_bg(self):
+    # ---------------- custom bg color ----------------
+    def apply_custom_bg_color(self):
+        """弹出取色器，选择自定义底色并合成"""
         if self.master_color is None:
             return
-        self.has_black_bg = True
+        color = QColorDialog.getColor(Qt.black, self, "选择底色")
+        if color.isValid():
+            self.custom_bg_color = (color.red(), color.green(), color.blue())
+            self.rebuild_working()
+
+    def reset_custom_bg(self):
+        if self.master_color is None:
+            return
+        self.custom_bg_color = None
         self.rebuild_working()
 
-    def reset_black_bg(self):
+    # ---------------- unmult ----------------
+    def apply_unmult(self):
+        """去除黑底（Unmult）：根据 Alpha 通道反推原始颜色，消除预乘黑底"""
         if self.master_color is None:
             return
-        self.has_black_bg = False
+        self.has_unmult = True
+        self.rebuild_working()
+
+    def reset_unmult(self):
+        if self.master_color is None:
+            return
+        self.has_unmult = False
         self.rebuild_working()
 
     # ---------------- brightness/contrast sync ----------------
@@ -2178,17 +2454,38 @@ class MainWindow(QMainWindow):
         if self.is_bw:
             base = to_bw_rgba(base)
 
-        if self.has_black_bg:
-            black = Image.new("RGBA", base.size, (0, 0, 0, 255))
-            black.paste(base, mask=base.split()[3])
-            black.putalpha(255)  # 强制完全不透明，确保黑底区域纯黑
-            base = black
+        if self.has_unmult:
+            # Unmult（去除黑底）：Alpha = max(R, G, B)，RGB 保持不变
+            # 原理：纯黑(0,0,0)→透明，亮色→不透明，与 AE Unmult 插件一致
+            import numpy as np
+            arr = np.array(base, dtype=np.uint8)
+            rgb = arr[:, :, :3]
+            new_alpha = np.max(rgb, axis=2)  # max(R, G, B) 作为 alpha
+            result = np.dstack([rgb, new_alpha])
+            base = Image.fromarray(result, "RGBA")
+
+        if self.custom_bg_color is not None:
+            bg = Image.new("RGBA", base.size, (*self.custom_bg_color, 255))
+            bg.paste(base, mask=base.split()[3])
+            bg.putalpha(255)
+            base = bg
 
         if self.target_size is not None:
             w, h = self.target_size
             base = base.resize((int(w), int(h)), resample=Image.LANCZOS)
 
         self.working_img = base
+
+        # 生成预览缩略图（限制最大边长，避免大图卡顿）
+        w, h = base.size
+        max_side = self._PREVIEW_MAX
+        if w > max_side or h > max_side:
+            ratio = min(max_side / w, max_side / h)
+            tw, th = int(w * ratio), int(h * ratio)
+            self._preview_thumb = base.resize((tw, th), resample=Image.LANCZOS)
+        else:
+            self._preview_thumb = base
+
         self.update_preview()
         self.update_info()
 
@@ -2209,26 +2506,39 @@ class MainWindow(QMainWindow):
             f"当前：{name}\n当前尺寸：{w} x {h}（{size_state}）\n模式：{bw_state}\n导出名：{export_base}"
         )
 
+    @property
+    def preview_img(self) -> Optional[Image.Image]:
+        """懒加载全尺寸预览图（带亮度/对比度），仅在导出/遮罩等需要时才计算"""
+        if self.working_img is None:
+            return None
+        if self._preview_dirty or self._preview_full_cache is None:
+            b = self.brightness_slider.value() / 100.0
+            c = self.contrast_slider.value() / 100.0
+            full = self.working_img.copy()
+            full = ImageEnhance.Brightness(full).enhance(b)
+            full = ImageEnhance.Contrast(full).enhance(c)
+            self._preview_full_cache = full
+            self._preview_dirty = False
+        return self._preview_full_cache
+
     def update_preview(self):
         if self.working_img is None:
             self.preview_label.clear()
             return
 
+        # 标记全尺寸缓存已过期，下次访问 preview_img 时才重新生成
+        self._preview_dirty = True
+
         b = self.brightness_slider.value() / 100.0
         c = self.contrast_slider.value() / 100.0
 
-        img = self.working_img.copy()
+        # 用缩略图做预览渲染（大幅提升大图性能）
+        thumb = self._preview_thumb if self._preview_thumb is not None else self.working_img
+        img = thumb.copy()
         img = ImageEnhance.Brightness(img).enhance(b)
         img = ImageEnhance.Contrast(img).enhance(c)
-        self.preview_img = img
 
         pix = pil_to_qpixmap(img)
-        pix = pix.scaled(
-            self.preview_label.width(),
-            self.preview_label.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
         self.preview_label.setPixmap(pix)
 
     # ---------------- export ----------------
@@ -2320,12 +2630,12 @@ class MainWindow(QMainWindow):
             self._resize_timer.setSingleShot(True)
             self._resize_timer.setInterval(50)
             self._resize_timer.timeout.connect(self._on_resize_done)
-        if self.preview_img is not None:
+        if self.working_img is not None:
             self._resize_timer.start()
 
     def _on_resize_done(self):
         """防抖结束后执行一次预览刷新"""
-        if self.preview_img is not None:
+        if self.working_img is not None:
             self.update_preview()
 
     def showEvent(self, event):

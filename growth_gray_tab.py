@@ -2115,16 +2115,32 @@ class GrowthGrayTab(QWidget):
     def _on_canvas_drop(self, paths: list):
         """
         画布拖拽文件回调：
+        - 单个视频文件 → 走视频导入流程
         - 单张图片 → 直接导入
         - 多张图片 → 提示用文件夹导入
         """
+        # 先检查是否有视频文件
+        video_paths = [
+            p for p in paths
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in SUPPORTED_VIDEO_EXTS
+        ]
+        if video_paths:
+            # 拖入了视频文件，取第一个
+            self._load_video_from_path(video_paths[0])
+            return
+
         # 过滤出支持的图片文件
         img_paths = [
             p for p in paths
             if os.path.isfile(p) and os.path.splitext(p)[1].lower() in SUPPORTED_EXTS
         ]
         if not img_paths:
-            QMessageBox.information(self, "提示", "未检测到支持的图片文件。\n支持格式：PNG、JPG、JPEG、TGA、BMP、WEBP")
+            QMessageBox.information(
+                self, "提示",
+                "未检测到支持的文件。\n"
+                "支持图片格式：PNG、JPG、JPEG、TGA、BMP、WEBP\n"
+                "支持视频格式：MP4、AVI、MOV、WEBM、MKV、FLV"
+            )
             return
         if len(img_paths) == 1:
             self._load_single_from_path(img_paths[0])
@@ -2205,6 +2221,18 @@ class GrowthGrayTab(QWidget):
         """从视频文件导入帧（仅读取首尾帧预览 + 记录路径和帧数）。"""
         global _HAS_CV2
         if not _HAS_CV2:
+            import sys
+            if getattr(sys, 'frozen', False):
+                # 打包环境：无法动态安装，提示用户该版本不支持
+                QMessageBox.warning(
+                    self, "缺少依赖",
+                    "当前版本未包含视频导入所需的 opencv-python 库。\n\n"
+                    "请联系开发者获取包含视频支持的新版本，\n"
+                    "或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入。"
+                )
+                return
+
+            # 开发环境：尝试自动安装
             reply = QMessageBox.question(
                 self, "缺少依赖",
                 "视频导入需要 opencv-python 库，是否自动安装？\n\n"
@@ -2216,7 +2244,7 @@ class GrowthGrayTab(QWidget):
                 return
 
             # ── 非阻塞安装 opencv-python ──
-            import subprocess, sys
+            import subprocess
             try:
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "pip", "install", "opencv-python"],
@@ -2295,7 +2323,27 @@ class GrowthGrayTab(QWidget):
         )
         if not path:
             return
+        self._load_video_from_path(path)
 
+    def _load_video_from_path(self, path: str):
+        """从指定路径加载视频文件（供按钮导入和拖拽导入共用）。"""
+        global _HAS_CV2
+        if not _HAS_CV2:
+            import sys
+            if getattr(sys, 'frozen', False):
+                QMessageBox.warning(
+                    self, "缺少依赖",
+                    "当前版本未包含视频导入所需的 opencv-python 库。\n\n"
+                    "请联系开发者获取包含视频支持的新版本，\n"
+                    "或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入。"
+                )
+            else:
+                QMessageBox.warning(
+                    self, "缺少依赖",
+                    "视频导入需要 opencv-python 库。\n"
+                    "请先通过「导入视频」按钮安装 opencv-python 后再试。"
+                )
+            return
         try:
             cap = cv2.VideoCapture(path)
             if not cap.isOpened():
@@ -2400,6 +2448,9 @@ class GrowthGrayTab(QWidget):
         if not self.name_input.text():
             self.name_input.setText(self._output_basename)
         self._refresh_canvas_overlay()
+        # 拖拽导入视频时自动切换到序列帧模式
+        if not self.btn_mode_seq.isChecked():
+            self._switch_mode("seq")
 
     @staticmethod
     def _cv2_to_pil(bgr_frame) -> Image.Image:
