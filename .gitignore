@@ -2,6 +2,7 @@ __pycache__/
 build/
 dist/
 *.spec
+!皮皮贴图修改器.spec
 *.exe
 *.log
 *.txt
