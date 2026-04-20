@@ -3,11 +3,18 @@ launcher.py —— 轻量级启动器
 作为打包入口，在导入主模块之前提供最外层异常兜底。
 当主模块 import 失败或初始化阶段崩溃时，用标准库弹窗提示用户并写入日志，
 而不是直接无响应退出。
+
+★ 架构说明：
+  打包后目录结构为 exe + _internal/ + app/，
+  业务代码全部在 app/ 子目录下，launcher 通过 importlib 动态加载。
+  这样每次发版只需更新 app/ 目录，exe 和 _internal/ 保持不变，
+  避免 iOA 安全白名单因文件哈希变化而失效。
 """
 import sys
 import os
 import traceback
 import subprocess
+import importlib
 from datetime import datetime
 
 # ── exe 文件名白名单配置 ──
@@ -15,10 +22,23 @@ _EXPECTED_EXE_NAME = "皮皮贴图修改器.exe"
 
 
 def _get_base_dir() -> str:
-    """获取 exe/脚本所在目录"""
+    """获取 exe/脚本所在目录（项目根目录）"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _get_app_dir() -> str:
+    """
+    智能定位 app/ 业务代码目录。
+    优先查找 <base_dir>/app/，如果不存在则回退到 base_dir 本身（向后兼容）。
+    """
+    base = _get_base_dir()
+    app_dir = os.path.join(base, "app")
+    if os.path.isdir(app_dir):
+        return app_dir
+    # 向后兼容：如果 app/ 目录不存在（未拆包），回退到根目录
+    return base
 
 
 # ── 在最早的时机设置好日志和全局异常钩子 ──
@@ -208,17 +228,22 @@ def main():
         # ── 检查 exe 文件名是否被篡改 ──
         _check_exe_name()
 
+        # ── 定位 app/ 业务代码目录并加入 sys.path ──
+        app_dir = _get_app_dir()
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+
         # ── 检测上次更新是否中途中断，如果是则尝试恢复 ──
         try:
-            from updater import recover_interrupted_update
-            recover_interrupted_update()
+            updater_mod = importlib.import_module("updater")
+            updater_mod.recover_interrupted_update()
         except Exception:
             pass  # updater 模块不存在或恢复失败，不影响正常启动
 
         # ── 清理上次更新遗留的旧版本文件夹 ──
         try:
-            from updater import cleanup_old_version
-            cleanup_old_version()
+            updater_mod = importlib.import_module("updater")
+            updater_mod.cleanup_old_version()
         except Exception:
             pass  # updater 模块不存在或清理失败，不影响正常启动
 
@@ -232,11 +257,12 @@ def main():
             except Exception:
                 pass
 
-        # 切换工作目录，确保相对路径正确
-        os.chdir(_BASE_DIR)
+        # 切换工作目录到 app/ 目录，确保业务代码中的相对路径（如 bug.svg）正确
+        os.chdir(app_dir)
 
         # 环境诊断信息（写入日志方便排查）
         print(f"[启动] 基础目录: {_BASE_DIR}", flush=True)
+        print(f"[启动] 业务代码目录: {app_dir}", flush=True)
         print(f"[启动] Python: {sys.version}", flush=True)
         print(f"[启动] 可执行文件: {sys.executable}", flush=True)
 
@@ -246,7 +272,8 @@ def main():
         print(f"[启动] PySide6 版本: {PySide6.__version__}", flush=True)
 
         print("[启动] 正在导入主模块...", flush=True)
-        from Texture_tool_GUI_with_tabs import main as app_main
+        main_mod = importlib.import_module("Texture_tool_GUI_with_tabs")
+        app_main = getattr(main_mod, "main")
 
         print("[启动] 导入完成，正在启动 GUI...", flush=True)
         app_main()

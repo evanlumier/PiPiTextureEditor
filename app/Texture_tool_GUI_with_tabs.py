@@ -953,11 +953,12 @@ class MainWindow(QMainWindow):
         # 设置窗口左上角图标（兼容打包环境，多路径回退查找）
         _ico_name = "TextureToolGUI.ico"
         _candidates = []
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _candidates.append(os.path.join(_this_dir, _ico_name))
         if getattr(sys, 'frozen', False):
+            # 打包环境：ico 在 exe 同级目录和 _MEIPASS 中
             _candidates.append(os.path.join(os.path.dirname(sys.executable), _ico_name))
             _candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _ico_name))
-        else:
-            _candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ico_name))
         _ico_path = next((p for p in _candidates if os.path.exists(p)), None)
         if _ico_path:
             self.setWindowIcon(QIcon(_ico_path))
@@ -1335,11 +1336,11 @@ class MainWindow(QMainWindow):
 
         _svg_name = "bug.svg"
         _svg_candidates = []
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _svg_candidates.append(os.path.join(_this_dir, _svg_name))
         if getattr(sys, 'frozen', False):
             _svg_candidates.append(os.path.join(os.path.dirname(sys.executable), _svg_name))
             _svg_candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _svg_name))
-        else:
-            _svg_candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _svg_name))
         _svg_path = next((p for p in _svg_candidates if os.path.exists(p)), None)
         if _svg_path:
             self._bug_btn.setIcon(QIcon(_svg_path))
@@ -2674,11 +2675,12 @@ def _show_crash_dialog(exc_text: str):
     from datetime import datetime
 
     # 写入日志文件，方便用户反馈
-    # 打包成 exe 后用 sys.executable 获取 exe 所在目录，否则用脚本目录
+    # 日志文件写到 exe 所在根目录（打包环境）或脚本上级目录（开发环境 app/ 下）
     if getattr(sys, 'frozen', False):
         base_dir = os.path.dirname(sys.executable)
     else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        _this = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.dirname(_this) if os.path.basename(_this) == "app" else _this
     log_path = os.path.join(base_dir, "error_log.txt")
     try:
         with open(log_path, "a", encoding="utf-8") as f:
@@ -2705,21 +2707,20 @@ def _show_crash_dialog(exc_text: str):
 
 
 def main():
-    # 切换工作目录到 exe/脚本所在目录，确保资源文件的相对路径正确
-    if getattr(sys, 'frozen', False):
-        os.chdir(os.path.dirname(sys.executable))
-    else:
-        os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    # 切换工作目录到脚本所在目录，确保资源文件的相对路径正确
+    # （launcher.py 已经 chdir 到 app/ 目录，这里做兜底确认）
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     try:
         app = QApplication(sys.argv)
         # 给整个应用设置图标（任务栏图标，多路径回退查找）
         _ico_name = "TextureToolGUI.ico"
         _candidates = []
+        _this_dir = os.path.dirname(os.path.abspath(__file__))
+        _candidates.append(os.path.join(_this_dir, _ico_name))
         if getattr(sys, 'frozen', False):
+            # 打包环境：ico 在 exe 同级目录和 _MEIPASS 中
             _candidates.append(os.path.join(os.path.dirname(sys.executable), _ico_name))
             _candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _ico_name))
-        else:
-            _candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ico_name))
         _ico_path = next((p for p in _candidates if os.path.exists(p)), None)
         if _ico_path:
             from PySide6.QtGui import QIcon

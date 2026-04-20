@@ -1,0 +1,4 @@
+{
+    "extraPaths": ["./app"],
+    "reportMissingImports": "warning"
+}

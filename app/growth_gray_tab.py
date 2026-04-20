@@ -2227,20 +2227,26 @@ class GrowthGrayTab(QWidget):
                 QMessageBox.warning(
                     self, "缺少依赖",
                     "当前版本未包含视频导入所需的 opencv-python 库。\n\n"
-                    "请联系开发者获取包含视频支持的新版本，\n"
-                    "或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入。"
+                    "视频导入功能需要 OpenCV 库支持，当前打包版本未包含该依赖。\n\n"
+                    "解决方案：\n"
+                    "1. 请联系开发者获取包含视频支持的新版本\n"
+                    "2. 或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入\n"
+                    "3. 支持的视频格式：MP4、AVI、MOV、WebM、MKV、FLV"
                 )
                 return
 
-            # 开发环境：尝试自动安装
-            reply = QMessageBox.question(
+            # 开发环境：提供清晰的安装选项
+            reply = QMessageBox.information(
                 self, "缺少依赖",
-                "视频导入需要 opencv-python 库，是否自动安装？\n\n"
-                "点击「Yes」将自动执行安装\n"
-                "点击「No」取消操作",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                "视频导入需要 opencv-python 库。\n\n"
+                "支持的视频格式：MP4、AVI、MOV、WebM、MKV、FLV\n\n"
+                "是否立即安装 opencv-python？\n"
+                "点击「确定」将自动执行安装\n"
+                "点击「取消」将返回主界面",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Ok:
                 return
 
             # ── 非阻塞安装 opencv-python ──
@@ -2334,15 +2340,24 @@ class GrowthGrayTab(QWidget):
                 QMessageBox.warning(
                     self, "缺少依赖",
                     "当前版本未包含视频导入所需的 opencv-python 库。\n\n"
-                    "请联系开发者获取包含视频支持的新版本，\n"
-                    "或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入。"
+                    "视频导入功能需要 OpenCV 库支持，当前打包版本未包含该依赖。\n\n"
+                    "解决方案：\n"
+                    "1. 请联系开发者获取包含视频支持的新版本\n"
+                    "2. 或将视频先转为序列帧图片后使用「选择序列帧文件夹」导入\n"
+                    "3. 支持的视频格式：MP4、AVI、MOV、WebM、MKV、FLV"
                 )
             else:
-                QMessageBox.warning(
+                reply = QMessageBox.information(
                     self, "缺少依赖",
-                    "视频导入需要 opencv-python 库。\n"
-                    "请先通过「导入视频」按钮安装 opencv-python 后再试。"
+                    "视频导入需要 opencv-python 库。\n\n"
+                    "是否立即安装 opencv-python？\n\n"
+                    "支持的视频格式：MP4、AVI、MOV、WebM、MKV、FLV\n"
+                    "安装完成后请重新点击「导入视频」按钮。",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Ok
                 )
+                if reply == QMessageBox.StandardButton.Ok:
+                    self._install_opencv()
             return
         try:
             cap = cv2.VideoCapture(path)

@@ -1,12 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-皮皮贴图修改器 —— PyInstaller 打包配置
+皮皮贴图修改器 —— PyInstaller 打包配置（拆包架构）
 使用方法：
     pyinstaller 皮皮贴图修改器.spec
+    然后运行 build.ps1 复制 app/ 目录到 dist/
+
+★ 架构说明：
+    打包后目录结构为 exe + _internal/ + app/
+    - exe 和 _internal/ 由 PyInstaller 生成，几乎不变（只要不升级依赖库）
+    - app/ 目录包含业务代码，每次发版只更新这个目录
+    - 这样 exe 的哈希不变，iOA 白名单不会失效
+
 注意事项：
     1. 打包前请确保已安装 opencv-python：pip install opencv-python
     2. 打包后输出目录为 dist/PPTextureEditor/
     3. exe 文件名为「皮皮贴图修改器.exe」，请勿修改
+    4. 打包完成后需要运行 build.ps1 或手动复制 app/ 到 dist/PPTextureEditor/app/
 """
 
 import os
@@ -22,16 +31,12 @@ a = Analysis(
     pathex=[SPEC_DIR],
     binaries=[],
     datas=[
-        # 打包资源文件
+        # 只打包图标文件到 exe 同级目录（供 launcher 和 Windows 任务栏使用）
         ('TextureToolGUI.ico', '.'),
-        ('bug.svg', '.'),
-        ('api_check.json', '.'),
-        ('api_check2.json', '.'),
-        ('release_check.json', '.'),
-        ('release_check2.json', '.'),
+        # 业务资源文件（bug.svg, json 等）已移至 app/ 目录，通过复制方式部署
     ],
     hiddenimports=[
-        # ── 核心依赖 ──
+        # ── 第三方依赖（必须打包进 _internal/）──
         'cv2',                      # opencv-python（视频导入功能）
         'numpy',
         'PIL',
@@ -39,15 +44,9 @@ a = Analysis(
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
-        # ── 项目模块 ──
-        'Texture_tool_GUI_with_tabs',
-        'growth_gray_tab',
-        'growth_algorithms',
-        'flowmap_tab',
-        'sprite_sheet_tab',
-        'image_viewer_tab',
-        'updater',
-        'version',
+        'PySide6.QtSvg',           # SVG 渲染支持（image_viewer_tab 使用）
+        # ── 项目模块不再打包（它们在 app/ 目录下作为源码部署）──
+        # 'Texture_tool_GUI_with_tabs', 'updater', 'version', ...
     ],
     hookspath=[],
     hooksconfig={},

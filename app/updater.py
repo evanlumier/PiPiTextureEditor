@@ -106,10 +106,23 @@ def _parse_version(v: str) -> tuple:
 
 # ── 公共工具 ──────────────────────────────────────────────────────
 def get_app_dir() -> str:
-    """获取当前应用（exe / 脚本）所在目录"""
+    """获取当前应用（exe / 脚本）所在目录（即 exe 所在的根目录）"""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    # 开发环境：如果当前文件在 app/ 子目录下，返回上一级
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(this_dir) == "app":
+        return os.path.dirname(this_dir)
+    return this_dir
+
+
+def get_code_dir() -> str:
+    """获取业务代码目录（app/ 子目录）"""
+    base = get_app_dir()
+    app_dir = os.path.join(base, "app")
+    if os.path.isdir(app_dir):
+        return app_dir
+    return base
 
 
 # ── 内部：查找系统 curl.exe ──────────────────────────────────────────
@@ -795,7 +808,8 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         # 开发环境下不执行自更新
         return False
 
-    app_dir = get_app_dir()
+    app_dir = get_app_dir()       # exe 所在根目录
+    code_dir = get_code_dir()     # 业务代码目录（app/ 子目录）
     backup_dir = os.path.join(app_dir, OLD_BACKUP_DIR_NAME)
     extract_dir = tempfile.mkdtemp(prefix="ppeditor_extract_")
     lock_file = os.path.join(app_dir, _UPDATE_LOCK_FILE)
@@ -879,13 +893,23 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         bat_path = os.path.join(tempfile.gettempdir(), "ppeditor_update.bat")
         current_pid = os.getpid()
 
+        # ── 智能检测新版本包结构 ──
+        # 如果新版本包中包含 app/ 子目录，说明是拆包架构，只替换 app/
+        # 否则走全量替换（向后兼容老版本包结构）
+        new_has_app_dir = os.path.isdir(os.path.join(source_dir, "app"))
+        is_split_arch = new_has_app_dir or (code_dir != app_dir)
+
         # 生成 bat 脚本内容
         # 注意：bat 文件用 GBK 编码写入，cmd.exe 默认代码页就是 GBK(936)，
         # 不要使用 chcp 65001 切换到 UTF-8，否则中文路径会乱码导致所有文件操作失败！
-        bat_content = f'''@echo off
+
+        if is_split_arch and new_has_app_dir:
+            # ── 拆包架构：只替换 app/ 目录 ──
+            new_app_source = os.path.join(source_dir, "app")
+            bat_content = f'''@echo off
 title 皮皮贴图修改器 - 正在更新...
 echo ========================================
-echo   皮皮贴图修改器 - 自动更新
+echo   皮皮贴图修改器 - 自动更新（增量模式）
 echo ========================================
 echo.
 
@@ -907,26 +931,21 @@ goto :wait_loop
 echo 旧版本已退出。
 echo.
 
-:: 备份旧文件
-echo [2/5] 备份旧版本文件...
+:: 备份旧 app/ 目录
+echo [2/5] 备份旧版本业务代码...
 if exist "{backup_dir}" rmdir /s /q "{backup_dir}" >nul 2>&1
 mkdir "{backup_dir}" >nul 2>&1
-
-for %%f in ("{app_dir}\\*") do (
-    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"=="{_UPDATE_LOCK_FILE}" if not "%%~nxf"=="error_log.txt" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
-)
-for /d %%f in ("{app_dir}\\*") do (
-    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
+if exist "{code_dir}" (
+    xcopy /s /e /y /q "{code_dir}\\*" "{backup_dir}\\" >nul 2>&1
 )
 echo 备份完成。
 echo.
 
-:: 兜底清理：确保旧 _internal 目录被彻底删除（防止 move 失败导致残留）
-if exist "{app_dir}\\_internal" rmdir /s /q "{app_dir}\\_internal" >nul 2>&1
-
-:: 复制新文件
-echo [3/5] 安装新版本...
-xcopy /s /e /y /q "{source_dir}\\*" "{app_dir}\\" >nul 2>&1
+:: 删除旧 app/ 目录并复制新的
+echo [3/5] 安装新版本业务代码...
+if exist "{code_dir}" rmdir /s /q "{code_dir}" >nul 2>&1
+mkdir "{code_dir}" >nul 2>&1
+xcopy /s /e /y /q "{new_app_source}\\*" "{code_dir}\\" >nul 2>&1
 if errorlevel 1 (
     echo 复制新文件失败！正在回滚...
     goto :rollback
@@ -959,6 +978,97 @@ del /f /q "%~f0" >nul 2>&1
 exit /b 0
 
 :rollback
+echo 正在回滚到旧版本...
+if exist "{code_dir}" rmdir /s /q "{code_dir}" >nul 2>&1
+mkdir "{code_dir}" >nul 2>&1
+xcopy /s /e /y /q "{backup_dir}\\*" "{code_dir}\\" >nul 2>&1
+del /f /q "{lock_file}" >nul 2>&1
+rmdir /s /q "{backup_dir}" >nul 2>&1
+echo 回滚完成。正在重新启动旧版本...
+start "" "{os.path.join(app_dir, current_exe_name)}"
+timeout /t 3 /nobreak >nul
+del /f /q "%~f0" >nul 2>&1
+exit /b 1
+'''
+        else:
+            # ── 全量替换模式（向后兼容老版本包结构）──
+            bat_content = f'''@echo off
+title 皮皮贴图修改器 - 正在更新...
+echo ========================================
+echo   皮皮贴图修改器 - 自动更新（全量模式）
+echo ========================================
+echo.
+
+:: 等待旧进程退出（最多等 30 秒）
+echo [1/5] 等待旧版本退出...
+set /a count=0
+:wait_loop2
+tasklist /FI "PID eq {current_pid}" 2>nul | find "{current_pid}" >nul 2>&1
+if errorlevel 1 goto :process_exited2
+set /a count+=1
+if %count% geq 60 (
+    echo 等待超时，强制继续...
+    goto :process_exited2
+)
+timeout /t 1 /nobreak >nul
+goto :wait_loop2
+
+:process_exited2
+echo 旧版本已退出。
+echo.
+
+:: 备份旧文件
+echo [2/5] 备份旧版本文件...
+if exist "{backup_dir}" rmdir /s /q "{backup_dir}" >nul 2>&1
+mkdir "{backup_dir}" >nul 2>&1
+
+for %%f in ("{app_dir}\\*") do (
+    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"=="{_UPDATE_LOCK_FILE}" if not "%%~nxf"=="error_log.txt" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
+)
+for /d %%f in ("{app_dir}\\*") do (
+    if not "%%~nxf"=="{OLD_BACKUP_DIR_NAME}" if not "%%~nxf"==".git" if not "%%~nxf"=="__pycache__" move /y "%%f" "{backup_dir}\\" >nul 2>&1
+)
+echo 备份完成。
+echo.
+
+:: 兜底清理：确保旧 _internal 目录被彻底删除（防止 move 失败导致残留）
+if exist "{app_dir}\\_internal" rmdir /s /q "{app_dir}\\_internal" >nul 2>&1
+
+:: 复制新文件
+echo [3/5] 安装新版本...
+xcopy /s /e /y /q "{source_dir}\\*" "{app_dir}\\" >nul 2>&1
+if errorlevel 1 (
+    echo 复制新文件失败！正在回滚...
+    goto :rollback2
+)
+echo 安装完成。
+echo.
+
+:: 删除锁文件
+echo [4/5] 清理临时文件...
+del /f /q "{lock_file}" >nul 2>&1
+echo 清理完成。
+echo.
+
+:: 启动新版本
+echo [5/5] 启动新版本...
+start "" "{os.path.join(app_dir, new_exe_name)}"
+echo.
+echo ========================================
+echo   更新完成！新版本已启动。
+echo   此窗口将在 3 秒后自动关闭。
+echo ========================================
+timeout /t 3 /nobreak >nul
+
+:: 清理旧版本备份目录
+rmdir /s /q "{backup_dir}" >nul 2>&1
+:: 清理临时解压目录
+rmdir /s /q "{extract_dir}" >nul 2>&1
+:: 删除自身
+del /f /q "%~f0" >nul 2>&1
+exit /b 0
+
+:rollback2
 echo 正在回滚到旧版本...
 for %%f in ("{backup_dir}\\*") do (
     move /y "%%f" "{app_dir}\\" >nul 2>&1
@@ -1015,6 +1125,7 @@ def recover_interrupted_update() -> bool:
     返回 True 表示检测到中断并已尝试恢复。
     """
     app_dir = get_app_dir()
+    code_dir = get_code_dir()
     lock_file = os.path.join(app_dir, _UPDATE_LOCK_FILE)
     backup_dir = os.path.join(app_dir, OLD_BACKUP_DIR_NAME)
 
@@ -1032,12 +1143,25 @@ def recover_interrupted_update() -> bool:
         lock_info = {}
 
     # 尝试从备份中恢复（覆盖可能损坏的文件）
+    # 注意：拆包架构下，增量更新备份的是 app/ 子目录的内容，
+    # 恢复时应恢复到 code_dir（app/ 子目录），而非 app_dir（根目录）。
+    # 通过检查备份内容来判断：如果备份中包含 .py 文件但不包含 .exe，
+    # 说明是增量备份，恢复到 code_dir；否则恢复到 app_dir（全量模式）。
     if os.path.exists(backup_dir) and os.listdir(backup_dir):
         _log.warning("发现备份目录，尝试恢复旧版本...")
+
+        # 判断备份类型：增量（app/ 内容）还是全量（整个目录）
+        backup_items = os.listdir(backup_dir)
+        has_exe = any(f.lower().endswith(".exe") for f in backup_items)
+        has_py = any(f.lower().endswith(".py") for f in backup_items)
+        # 如果备份中有 .py 但没有 .exe，说明是增量备份，恢复到 code_dir
+        restore_target = code_dir if (has_py and not has_exe) else app_dir
+        _log.warning("恢复目标目录: %s（增量=%s）", restore_target, has_py and not has_exe)
+
         try:
             for item in os.listdir(backup_dir):
                 src = os.path.join(backup_dir, item)
-                dst = os.path.join(app_dir, item)
+                dst = os.path.join(restore_target, item)
                 # 先删除目标（可能是更新中途写入的不完整文件）
                 try:
                     if os.path.isdir(dst):

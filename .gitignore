@@ -8,3 +8,4 @@ dist/
 *.txt
 *.b64
 _old_version_backup/
+_update_in_progress.lock
