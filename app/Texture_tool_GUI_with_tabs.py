@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageEnhance, ImageOps
 
+from export_dir_mixin import ExportDirMixin
+
 from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QRegularExpression, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QPixmap,
@@ -59,6 +61,7 @@ from flowmap_tab import FlowMapTab
 from growth_gray_tab import GrowthGrayTab
 from image_viewer_tab import ImageViewerTab
 from version import __version__
+from ue4_sync import get_sync_manager
 
 # =========================
 # 规则：输入框仅允许 A-Z a-z 0-9 _ （导出名由输入框保证）
@@ -67,886 +70,17 @@ VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 SUPPORTED_EXTS = [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"]
 
+from utils import pil_to_qpixmap, to_bw_rgba
 
-# =========================
-# 图像/UI 工具函数
-# =========================
-def pil_to_qpixmap(img: Image.Image) -> QPixmap:
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    data = img.tobytes("raw", "RGBA")
-    qimg = QImage(data, img.size[0], img.size[1], QImage.Format_RGBA8888)
-    return QPixmap.fromImage(qimg)
+from dialogs import PixRect, CropCanvas, CropDialog, MaskThresholdDialog
 
+from widgets import DropLabel, CheckerLabel, StackedTextTabBar
 
-def to_bw_rgba(img_rgba: Image.Image) -> Image.Image:
-    base = img_rgba.convert("RGBA")
-    gray = ImageOps.grayscale(base)
-    alpha = base.split()[-1]
-    return Image.merge("RGBA", (gray, gray, gray, alpha))
 
+class MainWindow(ExportDirMixin, QMainWindow):
+    # 跨线程安全信号：后台线程 emit，主线程自动接收（Qt 信号槽机制）
+    _ue4_export_signal = Signal(dict)
 
-@dataclass
-class PixRect:
-    x: int
-    y: int
-    w: int
-    h: int
-
-    def to_qrect(self) -> QRect:
-        return QRect(self.x, self.y, self.w, self.h)
-
-
-class CropCanvas(QLabel):
-    """稳定版裁切：拖拽创建；框内拖动移动；四角缩放；带遮罩与镂空。"""
-
-    HANDLE = 10
-    MIN_SIZE = 12
-
-    def __init__(self, pil_img: Image.Image):
-        super().__init__()
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#2a2a38;border-radius:10px;")
-        self.setMouseTracking(True)
-
-        self.pil_img = pil_img.convert("RGBA")
-        self.img_w, self.img_h = self.pil_img.size
-
-        self._pixmap_scaled: Optional[QPixmap] = None
-        self._pix_rect: Optional[QRect] = None  # scaled pixmap 在 label 内的实际区域
-
-        self.sel_rect: Optional[QRect] = None
-        self.drag_mode: Optional[str] = None  # new/move/resize
-        self.drag_start = QPoint()
-        self.sel_start = QRect()
-        self.resize_handle: Optional[str] = None
-
-        self._render()
-
-    def _render(self):
-        pix = pil_to_qpixmap(self.pil_img)
-        self._pixmap_scaled = pix.scaled(
-            max(1, self.width()),
-            max(1, self.height()),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.setPixmap(self._pixmap_scaled)
-
-        # 计算 pixmap 在 label 中的居中位置
-        lw, lh = self.width(), self.height()
-        pw, ph = self._pixmap_scaled.width(), self._pixmap_scaled.height()
-        x = int((lw - pw) / 2)
-        y = int((lh - ph) / 2)
-        self._pix_rect = QRect(x, y, pw, ph)
-        self.update()
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        self._render()
-
-    def _clamp_to_pix(self, r: QRect) -> QRect:
-        if not self._pix_rect:
-            return r
-        rr = r.normalized()
-
-        # 限制在 pix_rect 内
-        if rr.left() < self._pix_rect.left():
-            rr.moveLeft(self._pix_rect.left())
-        if rr.top() < self._pix_rect.top():
-            rr.moveTop(self._pix_rect.top())
-        if rr.right() > self._pix_rect.right():
-            rr.moveRight(self._pix_rect.right())
-        if rr.bottom() > self._pix_rect.bottom():
-            rr.moveBottom(self._pix_rect.bottom())
-
-        return rr
-
-    def _handle_rects(self) -> dict:
-        if self.sel_rect is None:
-            return {}
-        r = self.sel_rect.normalized()
-        s = self.HANDLE
-        half = s // 2
-        pts = {
-            "nw": QPoint(r.left(), r.top()),
-            "ne": QPoint(r.right(), r.top()),
-            "se": QPoint(r.right(), r.bottom()),
-            "sw": QPoint(r.left(), r.bottom()),
-        }
-        return {k: QRect(p.x() - half, p.y() - half, s, s) for k, p in pts.items()}
-
-    def _hit_handle(self, pos: QPoint) -> Optional[str]:
-        for k, hr in self._handle_rects().items():
-            if hr.contains(pos):
-                return k
-        return None
-
-    def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton or not self._pix_rect:
-            return
-
-        pos = event.pos()
-        if not self._pix_rect.contains(pos):
-            return
-
-        self.drag_start = pos
-
-        h = self._hit_handle(pos)
-        if h and self.sel_rect:
-            self.drag_mode = "resize"
-            self.resize_handle = h
-            self.sel_start = QRect(self.sel_rect)
-            return
-
-        if self.sel_rect and self.sel_rect.contains(pos):
-            self.drag_mode = "move"
-            self.sel_start = QRect(self.sel_rect)
-            return
-
-        self.drag_mode = "new"
-        self.sel_rect = QRect(pos, pos)
-        self.update()
-
-    def mouseMoveEvent(self, event):
-        if not self._pix_rect:
-            return
-
-        pos = event.pos()
-
-        if self.drag_mode is None:
-            # cursor 提示
-            if self._hit_handle(pos):
-                self.setCursor(Qt.SizeFDiagCursor)
-            elif self.sel_rect and self.sel_rect.contains(pos):
-                self.setCursor(Qt.SizeAllCursor)
-            else:
-                self.setCursor(Qt.ArrowCursor)
-            return
-
-        if self.drag_mode == "new":
-            end = QPoint(
-                max(self._pix_rect.left(), min(self._pix_rect.right(), pos.x())),
-                max(self._pix_rect.top(), min(self._pix_rect.bottom(), pos.y())),
-            )
-            self.sel_rect = self._clamp_to_pix(QRect(self.drag_start, end))
-            self.update()
-            return
-
-        if not self.sel_rect:
-            return
-
-        if self.drag_mode == "move":
-            delta = pos - self.drag_start
-            r = QRect(self.sel_start)
-            r.translate(delta)
-            self.sel_rect = self._clamp_to_pix(r)
-            self.update()
-            return
-
-        if self.drag_mode == "resize":
-            r0 = QRect(self.sel_start).normalized()
-            px = max(self._pix_rect.left(), min(self._pix_rect.right(), pos.x()))
-            py = max(self._pix_rect.top(), min(self._pix_rect.bottom(), pos.y()))
-
-            left, top, right, bottom = r0.left(), r0.top(), r0.right(), r0.bottom()
-            h = self.resize_handle
-
-            if h == "nw":
-                left, top = px, py
-            elif h == "ne":
-                right, top = px, py
-            elif h == "se":
-                right, bottom = px, py
-            elif h == "sw":
-                left, bottom = px, py
-
-            r = QRect(QPoint(left, top), QPoint(right, bottom)).normalized()
-            r = self._clamp_to_pix(r)
-
-            if r.width() < self.MIN_SIZE:
-                r.setRight(r.left() + self.MIN_SIZE)
-            if r.height() < self.MIN_SIZE:
-                r.setBottom(r.top() + self.MIN_SIZE)
-
-            self.sel_rect = self._clamp_to_pix(r)
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        self.drag_mode = None
-        self.resize_handle = None
-        self.setCursor(Qt.ArrowCursor)
-        if self.sel_rect:
-            self.sel_rect = self.sel_rect.normalized()
-            self.update()
-
-    def paintEvent(self, e):
-        # 先绘制框内底色（在图片下方，不会遮挡图片）
-        if self._pix_rect:
-            p0 = QPainter(self)
-            p0.setPen(Qt.NoPen)
-            p0.setBrush(QColor(58, 58, 74))  # #3a3a4a — 框内较亮底色
-            p0.drawRect(self._pix_rect)
-            p0.end()
-
-        # QLabel 绘制图片（在底色之上）
-        super().paintEvent(e)
-
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-
-        # 图片边缘指引线（比框内底色再亮一档）
-        if self._pix_rect:
-            border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a
-            border_pen.setWidth(1)
-            p.setPen(border_pen)
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(self._pix_rect)
-
-        if not self.sel_rect:
-            p.end()
-            return
-
-        path = QPainterPath()
-        path.addRect(self.rect())
-        path.addRect(self.sel_rect.normalized())
-        path.setFillRule(Qt.OddEvenFill)
-
-        # 半透明遮罩（PS 风格）
-        p.fillPath(path, QColor(0, 0, 0, 80))
-
-        # 选区边框
-        pen = QPen(QColor(255, 255, 255, 230))
-        pen.setWidth(2)
-        p.setPen(pen)
-        p.drawRect(self.sel_rect)
-
-        # 四角 handles
-        for hr in self._handle_rects().values():
-            p.fillRect(hr, QColor(255, 255, 255, 230))
-
-        p.end()
-
-    def rotate_image(self, clockwise: bool = True):
-        """旋转图片90度，clockwise=True顺时针，False逆时针。"""
-        angle = -90 if clockwise else 90
-        self.pil_img = self.pil_img.rotate(angle, expand=True)
-        self.img_w, self.img_h = self.pil_img.size
-        # 清除裁切选区
-        self.sel_rect = None
-        self._render()
-
-    def get_cropped_image(self) -> Optional[Image.Image]:
-        if not self.sel_rect or not self._pix_rect or not self._pixmap_scaled:
-            return None
-
-        r = self.sel_rect.normalized()
-
-        # 转为相对 pix_rect 的坐标
-        rx = r.left() - self._pix_rect.left()
-        ry = r.top() - self._pix_rect.top()
-        rw = r.width()
-        rh = r.height()
-
-        pw = self._pix_rect.width()
-        ph = self._pix_rect.height()
-
-        # 映射到原图
-        l = int(rx / pw * self.img_w)
-        t = int(ry / ph * self.img_h)
-        rr = int((rx + rw) / pw * self.img_w)
-        bb = int((ry + rh) / ph * self.img_h)
-
-        l = max(0, min(self.img_w - 1, l))
-        t = max(0, min(self.img_h - 1, t))
-        rr = max(l + 1, min(self.img_w, rr))
-        bb = max(t + 1, min(self.img_h, bb))
-
-        if rr - l < 2 or bb - t < 2:
-            return None
-
-        return self.pil_img.crop((l, t, rr, bb))
-
-
-class MaskThresholdDialog(QDialog):
-    """亮度阈值遮罩对话框：基于当前显示画面，通过亮度阈值识别主体。"""
-
-    def __init__(self, pil_img: Image.Image, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("遮罩生成 — 亮度阈值")
-        self.resize(800, 640)
-        self.setStyleSheet("""
-            QDialog { background-color: #1e1e2e; color: #cdd6f4; }
-            QLabel { color: #a6adc8; }
-            QPushButton {
-                background-color: #313244; color: #cdd6f4;
-                border: 1px solid #45475a; border-radius: 7px;
-                padding: 6px 18px; font-size: 13px;
-            }
-            QPushButton:hover { background-color: #45475a; border-color: #89b4fa; }
-            QPushButton:pressed { background-color: #89b4fa; color: #1e1e2e; }
-            QSlider::groove:horizontal {
-                height: 6px; background: #313244; border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #89b4fa; width: 16px; height: 16px;
-                margin: -5px 0; border-radius: 8px;
-            }
-            QSlider::sub-page:horizontal { background: #89b4fa; border-radius: 3px; }
-        """)
-
-        self.source_img = pil_img.convert("RGBA")
-        self.result_img: Optional[Image.Image] = None
-
-        # 预览区域
-        self.preview_label = QLabel()
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(640, 440)
-        self.preview_label.setStyleSheet("background-color: #11111b; border: 1px solid #45475a;")
-
-        # 阈值滑块行
-        thresh_row = QHBoxLayout()
-        thresh_row.addWidget(QLabel("亮度阈值："))
-        self.thresh_slider = QSlider(Qt.Horizontal)
-        self.thresh_slider.setRange(0, 255)
-        self.thresh_slider.setValue(128)
-        self.thresh_label = QLabel("128")
-        self.thresh_label.setFixedWidth(36)
-        self.thresh_label.setAlignment(Qt.AlignCenter)
-        thresh_row.addWidget(self.thresh_slider, 1)
-        thresh_row.addWidget(self.thresh_label)
-
-        tips = QLabel("提示：亮度 ≥ 阈值的像素将被识别为主体（白色），其余部分变为透明。\n"
-                      "此计算基于当前显示画面（已应用亮度/对比度调整）。")
-        tips.setWordWrap(True)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self._on_ok)
-        btns.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(tips)
-        layout.addWidget(self.preview_label, 1)
-        layout.addLayout(thresh_row)
-        layout.addWidget(btns)
-
-        self.thresh_slider.valueChanged.connect(self._on_thresh_changed)
-        # 初始预览
-        self._update_preview()
-
-    def _compute_mask(self, thresh: int) -> Image.Image:
-        """根据亮度阈值计算遮罩图：主体白色，背景透明。"""
-        img = self.source_img
-        r, g, b, a = img.split()
-        # 逐像素计算亮度：L = 0.299R + 0.587G + 0.114B
-        # 使用 PIL 的 merge + point 实现，无需 numpy
-        lum = Image.merge("RGB", (r, g, b)).convert("L")
-        # 亮度 >= 阈值 => 主体（白色不透明），否则 => 背景（透明）
-        mask = lum.point(lambda x: 255 if x >= thresh else 0)
-        # 生成结果：主体区域为白色，背景为透明
-        result = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        result.paste(white, mask=mask)
-        return result
-
-    def _on_thresh_changed(self, v: int):
-        self.thresh_label.setText(str(v))
-        self._update_preview()
-
-    def _update_preview(self):
-        thresh = self.thresh_slider.value()
-        preview = self._compute_mask(thresh)
-        pix = pil_to_qpixmap(preview)
-        pix = pix.scaled(
-            self.preview_label.width(),
-            self.preview_label.height(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.preview_label.setPixmap(pix)
-
-    def _on_ok(self):
-        thresh = self.thresh_slider.value()
-        self.result_img = self._compute_mask(thresh)
-        self.accept()
-
-
-class CropDialog(QDialog):
-
-    def __init__(self, pil_img: Image.Image, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("裁切/旋转")
-        self.resize(980, 720)
-        self.setStyleSheet("""
-            QDialog { background-color: #1e1e2e; color: #cdd6f4; }
-            QLabel { color: #a6adc8; }
-            QPushButton {
-                background-color: #313244; color: #cdd6f4;
-                border: 1px solid #45475a; border-radius: 7px;
-                padding: 6px 18px; font-size: 13px;
-            }
-            QPushButton:hover { background-color: #45475a; border-color: #89b4fa; }
-            QPushButton:pressed { background-color: #89b4fa; color: #1e1e2e; }
-        """)
-
-        self.canvas = CropCanvas(pil_img)
-        self.canvas.setMinimumSize(810, 560)
-
-        tips = QLabel("拖拽创建裁切框；框内拖动移动；拖动角点缩放；确定后应用。")
-        tips.setWordWrap(True)
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self._on_ok)
-        btns.rejected.connect(self.reject)
-
-        # ---- 左侧工具栏 ----
-        toolbar = QWidget()
-        toolbar.setFixedWidth(42)
-        toolbar.setStyleSheet("background: #252536; border-radius: 8px;")
-        tb_layout = QVBoxLayout(toolbar)
-        tb_layout.setContentsMargins(4, 8, 4, 8)
-        tb_layout.setSpacing(6)
-
-        btn_ccw = QPushButton("↺")
-        btn_ccw.setToolTip("逆时针旋转 90°")
-        btn_ccw.setFixedSize(34, 34)
-        btn_ccw.setStyleSheet("""
-            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
-                          background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
-            QPushButton:hover { background: #45475a; border-color: #89b4fa; }
-            QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
-        """)
-        btn_ccw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=False))
-
-        btn_cw = QPushButton("↻")
-        btn_cw.setToolTip("顺时针旋转 90°")
-        btn_cw.setFixedSize(34, 34)
-        btn_cw.setStyleSheet("""
-            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
-                          background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
-            QPushButton:hover { background: #45475a; border-color: #89b4fa; }
-            QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
-        """)
-        btn_cw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=True))
-
-        tb_layout.addWidget(btn_ccw)
-        tb_layout.addWidget(btn_cw)
-        tb_layout.addStretch()
-
-        # ---- 中间区域（工具栏 + 画布）水平排列 ----
-        center_layout = QHBoxLayout()
-        center_layout.setSpacing(6)
-        center_layout.addWidget(toolbar)
-        center_layout.addWidget(self.canvas, 1)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(tips)
-        layout.addLayout(center_layout, 1)
-        layout.addWidget(btns)
-
-        self.result_img: Optional[Image.Image] = None
-
-    def _on_ok(self):
-        cropped = self.canvas.get_cropped_image()
-        if cropped is not None:
-            # 有裁切框：应用裁切
-            self.result_img = cropped.convert("RGBA")
-        else:
-            # 无裁切框：直接使用当前图片（可能已旋转）
-            self.result_img = self.canvas.pil_img.convert("RGBA")
-        self.accept()
-
-
-class DropLabel(QLabel):
-    def __init__(self, on_drop_callback):
-        super().__init__()
-        self.on_drop_callback = on_drop_callback
-        self._parent_window = None  # 用于弹出文件对话框
-        self.setAcceptDrops(True)
-        self.setAlignment(Qt.AlignCenter)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setText("拖拽图片到这里\n或点击此区域导入")
-        self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
-        )
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            parent = self._parent_window or self
-            path, _ = QFileDialog.getOpenFileName(
-                parent, "选择图片", "", "Images (*.png *.jpg *.jpeg *.tga *.bmp *.webp)"
-            )
-            if path:
-                self.on_drop_callback(path)
-        super().mousePressEvent(event)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if urls:
-                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
-                if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
-                    event.acceptProposedAction()
-                    self.setStyleSheet(
-                        "border:2px dashed #89b4fa;border-radius:10px;padding:20px;"
-                        "background:rgba(137,180,250,0.08);color:#89b4fa;font-size:13px;"
-                    )
-                    return
-        event.ignore()
-
-    def dragLeaveEvent(self, event):
-        self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
-        )
-
-    def dropEvent(self, event):
-        self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
-        )
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        path = urls[0].toLocalFile()
-        if path:
-            ext = os.path.splitext(path)[1].lower()
-            if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
-                self.on_drop_callback(path)
-
-
-class CheckerLabel(QWidget):
-    """带棋盘格透明背景的预览控件，支持滚轮缩放、右键拖拽平移、拖拽/点击导入"""
-    def __init__(self, cell=12, color1=None, color2=None, parent=None):
-        super().__init__(parent)
-        self.cell = cell
-        self.color1 = color1 or QColor(42, 42, 58)
-        self.color2 = color2 or QColor(30, 30, 46)
-        self._hovered = False
-        self._drag_hovering = False  # 拖拽悬停状态
-        self._on_drop_callback = None  # 拖拽/点击导入回调
-        self._parent_window = None  # 用于弹出文件对话框
-        self.setMouseTracking(True)
-        self.setAcceptDrops(True)
-
-        # ── 缩放 & 平移状态 ──
-        self._source_pix: Optional[QPixmap] = None  # 原始 pixmap
-        self._scale: float = 1.0       # 当前缩放倍率
-        self._offset = QPointF(0, 0)   # 图片左上角在控件中的偏移
-        self._fit_done: bool = False    # 是否已执行过自适应
-
-        # ── 右键拖拽 ──
-        self._dragging: bool = False
-        self._last_mouse = QPointF()
-
-    # ── 兼容 QLabel 接口 ──────────────────────────────────────────────
-    def setPixmap(self, pix: QPixmap):
-        """设置要显示的 pixmap，仅首次或图片尺寸变化时自动适配窗口"""
-        old = self._source_pix
-        self._source_pix = pix
-        # 仅在首次设置或图片尺寸发生变化时才重置缩放
-        if old is None or old.isNull() or old.size() != pix.size():
-            self._fit_to_view()
-        self.update()
-
-    def pixmap(self) -> Optional[QPixmap]:
-        return self._source_pix
-
-    def clear(self):
-        self._source_pix = None
-        self._scale = 1.0
-        self._offset = QPointF(0, 0)
-        self._fit_done = False
-        self.update()
-
-    def setAlignment(self, *args):
-        pass  # 兼容旧调用，不需要实际处理
-
-    # ── 自适应窗口 ──────────────────────────────────────────────────
-    def _fit_to_view(self):
-        """让图片完整显示在控件中（适配窗口）"""
-        pm = self._source_pix
-        if pm is None or pm.isNull():
-            return
-        w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
-            return
-        pw, ph = pm.width(), pm.height()
-        if pw <= 0 or ph <= 0:
-            return
-        self._scale = min(w / pw, h / ph)
-        # 居中
-        disp_w = pw * self._scale
-        disp_h = ph * self._scale
-        self._offset = QPointF((w - disp_w) / 2, (h - disp_h) / 2)
-        self._fit_done = True
-
-    def _clamp_offset(self):
-        """限制图片不能完全拖出预览框（至少保留 20% 可见）"""
-        pm = self._source_pix
-        if pm is None or pm.isNull():
-            return
-        pw = pm.width() * self._scale
-        ph = pm.height() * self._scale
-        w, h = self.width(), self.height()
-        # 至少保留 20% 的图片在可视区域内
-        margin_x = pw * 0.2
-        margin_y = ph * 0.2
-        min_x = -(pw - margin_x)
-        max_x = w - margin_x
-        min_y = -(ph - margin_y)
-        max_y = h - margin_y
-        ox = max(min_x, min(max_x, self._offset.x()))
-        oy = max(min_y, min(max_y, self._offset.y()))
-        self._offset = QPointF(ox, oy)
-
-    def _pixmap_rect(self):
-        """计算当前 pixmap 在控件中的显示矩形"""
-        pm = self._source_pix
-        if pm is None or pm.isNull():
-            return None
-        pw = pm.width() * self._scale
-        ph = pm.height() * self._scale
-        return QRectF(self._offset.x(), self._offset.y(), pw, ph)
-
-    # ── 鼠标事件 ──────────────────────────────────────────────────────
-    def enterEvent(self, event):
-        self._hovered = True
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hovered = False
-        if not self._dragging:
-            self.setCursor(Qt.ArrowCursor)
-        self.update()
-        super().leaveEvent(event)
-
-    def mousePressEvent(self, event):
-        # 右键拖拽平移
-        if event.button() == Qt.RightButton and self._source_pix is not None:
-            self._dragging = True
-            self._last_mouse = event.position()
-            self.setCursor(Qt.ClosedHandCursor)
-            return
-        # 左键点击导入（仅在没有图片时）
-        if event.button() == Qt.LeftButton and self._on_drop_callback is not None:
-            if self._source_pix is None or self._source_pix.isNull():
-                parent = self._parent_window or self
-                path, _ = QFileDialog.getOpenFileName(
-                    parent, "选择图片", "", "Images (*.png *.jpg *.jpeg *.tga *.bmp *.webp)"
-                )
-                if path:
-                    self._on_drop_callback(path)
-                return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            delta = event.position() - self._last_mouse
-            self._offset = QPointF(self._offset.x() + delta.x(),
-                                   self._offset.y() + delta.y())
-            self._clamp_offset()
-            self._last_mouse = event.position()
-            self.update()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.RightButton and self._dragging:
-            self._dragging = False
-            self.setCursor(Qt.ArrowCursor)
-            return
-        super().mouseReleaseEvent(event)
-
-    def wheelEvent(self, event):
-        """滚轮缩放，以鼠标位置为缩放中心"""
-        pm = self._source_pix
-        if pm is None or pm.isNull():
-            return
-        pos = event.position()
-        old_scale = self._scale
-        delta = event.angleDelta().y()
-        factor = 1.15 if delta > 0 else (1.0 / 1.15)
-        new_scale = max(0.02, min(old_scale * factor, 30.0))
-        # 以鼠标位置为缩放中心
-        self._offset = QPointF(
-            pos.x() - (pos.x() - self._offset.x()) * new_scale / old_scale,
-            pos.y() - (pos.y() - self._offset.y()) * new_scale / old_scale,
-        )
-        self._scale = new_scale
-        self._clamp_offset()
-        self.update()
-        event.accept()
-
-    def mouseDoubleClickEvent(self, event):
-        """双击左键适配窗口"""
-        if event.button() == Qt.LeftButton and self._source_pix is not None:
-            self._fit_to_view()
-            self.update()
-
-    # ── 拖拽导入 ──────────────────────────────────────────────────────
-    def dragEnterEvent(self, event):
-        if self._on_drop_callback is not None and event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if urls:
-                ext = os.path.splitext(urls[0].toLocalFile())[1].lower()
-                if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
-                    event.acceptProposedAction()
-                    self._drag_hovering = True
-                    self.update()
-                    return
-        event.ignore()
-
-    def dragLeaveEvent(self, event):
-        self._drag_hovering = False
-        self.update()
-
-    def dropEvent(self, event):
-        self._drag_hovering = False
-        self.update()
-        if self._on_drop_callback is None:
-            return
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-        path = urls[0].toLocalFile()
-        if path:
-            ext = os.path.splitext(path)[1].lower()
-            if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
-                self._on_drop_callback(path)
-
-    def resizeEvent(self, event):
-        old_size = event.oldSize()
-        new_size = event.size()
-        super().resizeEvent(event)
-        # 窗口大小变化时，按比例调整偏移量以保持视觉中心不变
-        if self._source_pix is not None and not self._source_pix.isNull():
-            if old_size.width() > 0 and old_size.height() > 0:
-                # 计算旧视口中心对应的图片坐标，在新视口中保持该点居中
-                old_cx = old_size.width() / 2.0
-                old_cy = old_size.height() / 2.0
-                new_cx = new_size.width() / 2.0
-                new_cy = new_size.height() / 2.0
-                self._offset = QPointF(
-                    self._offset.x() + (new_cx - old_cx),
-                    self._offset.y() + (new_cy - old_cy),
-                )
-                self._clamp_offset()
-            else:
-                self._fit_to_view()
-
-    # ── 绘制 ──────────────────────────────────────────────────────────
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-
-        # 圆角裁剪（配合 stylesheet 的 border-radius）
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()), 10, 10)
-        p.setClipPath(path)
-
-        # 棋盘格背景
-        cell = self.cell
-        cols = self.width() // cell + 1
-        rows = self.height() // cell + 1
-        for r in range(rows):
-            for c in range(cols):
-                color = self.color1 if (r + c) % 2 == 0 else self.color2
-                p.fillRect(c * cell, r * cell, cell, cell, color)
-
-        pm = self._source_pix
-        has_image = pm is not None and not pm.isNull()
-
-        # 绘制图片
-        if has_image:
-            pix_rect = self._pixmap_rect()
-            if pix_rect:
-                p.drawPixmap(pix_rect, pm, QRectF(0, 0, pm.width(), pm.height()))
-
-        # 没有图片时显示拖拽提示
-        if not has_image and self._on_drop_callback is not None:
-            p.setRenderHint(QPainter.Antialiasing)
-            # 拖拽悬停时高亮边框
-            if self._drag_hovering:
-                border_pen = QPen(QColor(137, 180, 250))  # #89b4fa
-                border_pen.setWidth(2)
-                border_pen.setStyle(Qt.DashLine)
-                p.setPen(border_pen)
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 10, 10)
-                p.setPen(QColor(137, 180, 250))
-            else:
-                # 虚线边框
-                border_pen = QPen(QColor(69, 71, 90))  # #45475a
-                border_pen.setWidth(2)
-                border_pen.setStyle(Qt.DashLine)
-                p.setPen(border_pen)
-                p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 10, 10)
-                p.setPen(QColor(108, 112, 134))  # #6c7086
-            font = p.font()
-            font.setPixelSize(14)
-            p.setFont(font)
-            p.drawText(self.rect(), Qt.AlignCenter, "拖拽图片到此处导入\n或点击此区域选择文件")
-            # 有提示时显示手型光标
-            self.setCursor(Qt.PointingHandCursor)
-        elif not has_image:
-            self.setCursor(Qt.ArrowCursor)
-        else:
-            # 有图片时恢复默认光标
-            if not self._dragging:
-                self.setCursor(Qt.ArrowCursor)
-
-        # hover 时绘制图片边界指引线
-        if self._hovered and has_image:
-            pix_rect = self._pixmap_rect()
-            if pix_rect:
-                p.setRenderHint(QPainter.Antialiasing, False)
-                border_pen = QPen(QColor(90, 90, 106))  # #5a5a6a
-                border_pen.setWidth(1)
-                p.setPen(border_pen)
-                p.setBrush(Qt.NoBrush)
-                p.drawRect(pix_rect.toRect())
-
-        p.end()
-
-
-# =========================
-# 自定义左侧 TabBar：文字竖排堆叠显示（上下排列）
-# =========================
-class StackedTextTabBar(QTabBar):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setDrawBase(False)
-
-    def tabSizeHint(self, index):
-        text = self.tabText(index) or ""
-        fm = QFontMetrics(self.font())
-        lines = text.split("\n")
-        max_w = 0
-        for ln in lines:
-            max_w = max(max_w, fm.horizontalAdvance(ln))
-        h = fm.height() * max(1, len(lines)) + 18
-        w = max(44, max_w + 18)
-        return QSize(w, max(120, h))
-
-    def paintEvent(self, event):
-        painter = QStylePainter(self)
-        opt = QStyleOptionTab()
-
-        for i in range(self.count()):
-            self.initStyleOption(opt, i)
-            painter.drawControl(QStyle.CE_TabBarTabShape, opt)
-
-            r = opt.rect.adjusted(6, 6, -6, -6)
-            painter.save()
-            painter.drawText(r, Qt.AlignCenter, self.tabText(i))
-            painter.restore()
-
-
-class MainWindow(QMainWindow):
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("PPEditor")
@@ -1303,6 +437,14 @@ class MainWindow(QMainWindow):
         self.source_color: Optional[Image.Image] = None  # 最初导入（永远不变）
         self.master_color: Optional[Image.Image] = None  # 当前基础（裁切后会替换为裁切结果）
 
+        # UE4 来源信息：按 Tab 索引独立存储，每个 Tab 有自己的来源信息
+        # 格式：{tab_index: {"asset_path": str, "asset_name": str}}
+        # 这样切换 Tab 时导出信息互不干扰
+        self._ue4_source_info_per_tab: dict = {}  # {0: {...}, 1: {...}, 2: {...}, 3: {...}}
+
+        # UE4 目标路径：按 Tab 索引独立存储，切换 Tab 时自动恢复对应路径
+        self._ue4_target_path_per_tab: dict = {}  # {0: "/Game/...", 2: "/Game/...", ...}
+
         self.is_bw: bool = False
         self.has_unmult: bool = False
         self.custom_bg_color: Optional[Tuple[int, int, int]] = None
@@ -1324,8 +466,49 @@ class MainWindow(QMainWindow):
         # 用自定义 TabBar（竖排文字），注意：必须先 setTabBar 再 setShape
         tabs.setTabBar(StackedTextTabBar())
         tabs.tabBar().setShape(QTabBar.RoundedWest)
-        self.setCentralWidget(tabs)
         self._tabs = tabs  # 保存引用，供跨 tab 切换使用
+
+        # ── 全局 UE4 联动区域（所有 tab 共享，放在 tab 内容区下方） ──
+        ue4_bar = QWidget()
+        ue4_bar.setStyleSheet(
+            "background-color: #252535; border-top: 1px solid #383850;"
+        )
+        ue4_bar_layout = QHBoxLayout(ue4_bar)
+        ue4_bar_layout.setContentsMargins(12, 6, 12, 6)
+        ue4_bar_layout.setSpacing(8)
+
+        ue4_icon_label = QLabel("🔗")
+        ue4_icon_label.setFixedWidth(20)
+        ue4_icon_label.setAlignment(Qt.AlignCenter)
+        ue4_bar_layout.addWidget(ue4_icon_label)
+
+        ue4_bar_layout.addWidget(QLabel("UE4路径："))
+        self.ue4_target_path = QLineEdit()
+        self.ue4_target_path.setPlaceholderText("/Game/Art/UI/Textures")
+        # 启动时加载 Tab 0 的缓存路径（默认显示 Tab 0）
+        init_path = self._load_ue4_target_path(0)
+        self.ue4_target_path.setText(init_path)
+        if init_path:
+            self._ue4_target_path_per_tab[0] = init_path
+        ue4_bar_layout.addWidget(self.ue4_target_path, 1)
+
+        self.btn_export_ue4 = QPushButton("导入UE4")
+        self.btn_export_ue4.setStyleSheet(
+            "background:#a6e3a1; color:#1e1e2e; font-weight:700;"
+            "padding:6px 18px; border-radius:7px;"
+        )
+        self.btn_export_ue4.clicked.connect(self.export_to_ue4)
+        ue4_bar_layout.addWidget(self.btn_export_ue4)
+        self._ue4_bar = ue4_bar  # 保存引用，供 bug 按钮定位使用
+
+        # 将 tabs + UE4 联动区域组合为中央容器
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(tabs, 1)
+        central_layout.addWidget(ue4_bar, 0)
+        self.setCentralWidget(central)
 
         # ── 左下角 bug 按钮（覆盖在主窗口上，绝对定位） ──
         self._bug_btn = QPushButton(self)
@@ -1381,8 +564,17 @@ class MainWindow(QMainWindow):
         tabs.addTab(growth_tab, "灰\n度\n图\n生\n成")
         tabs.addTab(image_viewer_tab, "全\n能\n看\n图")
 
+        # 保存各 tab 引用，供 UE4 联动接口使用
+        self._sprite_tab = sprite_tab
+        self._flowmap_tab = flowmap_tab
+        self._growth_tab = growth_tab
+        self._image_viewer_tab = image_viewer_tab
+
         # 连接全能看图的「转移至贴图修改」信号
         image_viewer_tab.transfer_to_texture.connect(self._on_transfer_from_viewer)
+
+        # 连接 tab 切换信号，更新 UE4 按钮状态
+        tabs.currentChanged.connect(self._on_tab_changed)
         # Left
         left_layout = QVBoxLayout()
         self.preview_label = CheckerLabel(cell=12)
@@ -1678,6 +870,14 @@ class MainWindow(QMainWindow):
         # ── 后台检查更新 ──
         self._start_update_checker()
 
+        # ── 启动 UE4 同步（创建 Named Mutex） ──
+        sync_mgr = get_sync_manager()
+        sync_mgr.start()
+
+        # ── 启动 UE4 导出监听（接收"发送到皮皮"的贴图） ──
+        # 使用信号槽实现线程安全的跨线程通信（后台线程 emit → 主线程 slot）
+        self._ue4_export_signal.connect(self._load_from_ue4_safe)
+        sync_mgr.start_export_listener(self._on_ue4_export_received)
     # ---------------- 关于弹窗 ----------------
     def _show_about_dialog(self):
         """点击 bug 按钮后弹出「关于」对话框，包含版本信息和检查更新按钮"""
@@ -2106,11 +1306,235 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(enabled)
         self.chk_overwrite.setEnabled(enabled)
 
+    # ---------------- UE4 导出接收回调 ----------------
+    def _on_ue4_export_received(self, export_data: dict):
+        """
+        当 UE4 发送贴图到皮皮时的回调（在后台线程 PiPi-ExportListener 中调用）。
+        通过 Qt 信号槽机制安全地将数据传递到主线程处理。
+        """
+        tga_path = export_data.get("tga_path", "")
+        asset_name = export_data.get("asset_name", "")
+        if not tga_path or not os.path.isfile(tga_path):
+            return
+
+        # 通过信号槽跨线程安全地传递到主线程（Qt 自动排队到主线程事件循环）
+        self._ue4_export_signal.emit(export_data)
+
+    def _load_from_ue4_safe(self, export_data: dict):
+        """信号槽接收端（在主线程中执行），从 export_data 中提取路径并加载。"""
+        tga_path = export_data.get("tga_path", "")
+        asset_name = export_data.get("asset_name", "")
+        asset_path = export_data.get("asset_path", "")
+        if not tga_path or not os.path.isfile(tga_path):
+            return
+
+        # 根据资产类型路由到对应 Tab（优先通过像素内容分析判断）
+        texture_type = self._detect_ue4_texture_type(asset_name, asset_path, tga_path)
+        self._load_from_ue4(tga_path, asset_name, asset_path, texture_type)
+
+    @staticmethod
+    def _detect_ue4_texture_type(asset_name: str, asset_path: str, tga_path: str = "") -> str:
+        """
+        综合判断 UE4 贴图类型，优先通过图片像素内容分析，名字/路径作为辅助。
+
+        法线贴图的像素特征：
+        - B 通道（z 分量）均值通常很高（> 180），因为大部分法线朝上（z ≈ 1）
+        - R 和 G 通道（x, y 分量）均值接近 128（中性值）
+        - 三通道标准差相对较低（法线图颜色分布集中）
+
+        返回值：
+            "normal"  - 法线贴图
+            "default" - 普通贴图（默认）
+        """
+        import numpy as np
+
+        # ── 第一优先级：像素内容分析 ──
+        if tga_path and os.path.isfile(tga_path):
+            try:
+                img = Image.open(tga_path)
+                # 转为 RGB 进行分析
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                arr = np.array(img, dtype=np.float32)
+
+                r_mean = arr[:, :, 0].mean()
+                g_mean = arr[:, :, 1].mean()
+                b_mean = arr[:, :, 2].mean()
+
+                # 法线图判定条件：
+                # 1. B 通道均值 > 180（法线 z 分量偏高）
+                # 2. R 和 G 通道均值在 100~160 范围内（接近中性 128）
+                # 3. B 通道均值明显高于 R 和 G（至少高 30）
+                is_normal_by_pixel = (
+                    b_mean > 180
+                    and 80 < r_mean < 175
+                    and 80 < g_mean < 175
+                    and b_mean - r_mean > 30
+                    and b_mean - g_mean > 30
+                )
+
+                if is_normal_by_pixel:
+                    return "normal"
+
+            except Exception:
+                pass  # 图片分析失败，降级到名字判断
+
+        # ── 第二优先级：名字/路径辅助判断 ──
+        name = asset_name.strip()
+        # UE4 法线贴图命名惯例：以 _N 结尾（如 T_Rock_N）
+        if name.endswith("_N") or name.endswith("_Normal"):
+            return "normal"
+        # 路径中包含 Normal 目录
+        if "Normal" in asset_path or "/N/" in asset_path:
+            return "normal"
+
+        return "default"
+
+    def _load_from_ue4(self, tga_path: str, asset_name: str, asset_path: str = "", texture_type: str = "default"):
+        """
+        在主线程中加载 UE4 发送过来的贴图，根据类型路由到对应 Tab。
+
+        参数：
+            tga_path: TGA 文件路径
+            asset_name: 资产名称
+            asset_path: UE4 中的资产目录路径（如 /Game/Art/Characters/Hero）
+            texture_type: 贴图类型（"normal" / "default"）
+        """
+        try:
+            if texture_type == "normal":
+                # 法线贴图 → 路由到法线绘制 Tab（index 2）
+                self._load_normal_from_ue4(tga_path, asset_name)
+            else:
+                # 默认 → 加载到贴图修改 Tab（index 0）
+                self._tabs.setCurrentIndex(0)
+                self.load_image(tga_path)
+
+            # 记录 UE4 来源信息（用于导出时覆盖原文件）
+            # 根据贴图类型确定目标 Tab 索引
+            target_tab_idx = 2 if texture_type == "normal" else 0
+
+            if asset_path and asset_path.startswith("/Game"):
+                # UE4 端发送的 asset_path 可能是以下格式之一：
+                # 1. 完整资产路径：/Game/Art/Tex/T_123_3
+                # 2. UE4 ObjectPath：/Game/Art/Tex/T_123_3.T_123_3
+                # 3. 纯目录路径：/Game/Art/Tex
+                # 需要提取目录部分作为 target_path（send_import_request 期望目录路径）
+
+                # 先处理 ObjectPath 格式（去掉 .AssetName 后缀）
+                clean_path = asset_path.split(".")[0] if "." in asset_path else asset_path
+                clean_path = clean_path.rstrip("/")
+
+                # 提取最后一段
+                last_segment = clean_path.split("/")[-1] if "/" in clean_path else ""
+
+                # 如果最后一段等于 asset_name，说明是完整路径，需要去掉资产名
+                if asset_name and last_segment == asset_name:
+                    dir_path = "/".join(clean_path.split("/")[:-1])
+                else:
+                    dir_path = clean_path
+
+                # 确保 dir_path 不为空
+                if not dir_path or dir_path == "/Game":
+                    dir_path = clean_path
+
+                import logging
+                logging.getLogger("PiPi").debug(
+                    f"UE4 asset_path 解析: 原始={asset_path}, 清理后={clean_path}, "
+                    f"目录={dir_path}, 资产名={asset_name}"
+                )
+
+                # 按 Tab 索引独立存储来源信息
+                self._ue4_source_info_per_tab[target_tab_idx] = {
+                    "asset_path": dir_path,
+                    "asset_name": asset_name,
+                }
+                # 按 Tab 索引独立存储目标路径
+                self._ue4_target_path_per_tab[target_tab_idx] = dir_path
+                # 自动填充 UE4 目标路径文本框（填入目录路径）
+                self.ue4_target_path.setText(dir_path)
+                self._save_ue4_target_path(target_tab_idx, dir_path)
+                # 更新命名预览，显示 UE4 原始资产名称
+                self.update_name_preview()
+            else:
+                # 清除对应 Tab 的来源信息
+                self._ue4_source_info_per_tab.pop(target_tab_idx, None)
+
+            # 将窗口带到前台
+            self.raise_()
+            self.activateWindow()
+        except Exception as e:
+            self.statusBar().showMessage(f"UE4 贴图加载失败: {e}", 5000)
+        finally:
+            # 清理 TGA 临时文件（已加载到内存，不再需要磁盘文件）
+            try:
+                if os.path.exists(tga_path):
+                    os.remove(tga_path)
+            except OSError:
+                pass
+
+    def _load_normal_from_ue4(self, tga_path: str, asset_name: str):
+        """
+        从 UE4 接收法线贴图并加载到法线绘制 Tab 的法线结果区（normal_map）。
+        - 将法线图 RGB 解码为 float32 法线向量写入 canvas.normal_map
+        - 自动打开"显示全图"以便用户查看导入结果
+        - 参考图区域保持不变（用于放置正常图片）
+        """
+        # 切换到法线绘制 Tab
+        self._tabs.setCurrentIndex(2)
+        import numpy as np
+        try:
+            img = Image.open(tga_path).convert("RGB")
+            w, h = img.size
+
+            # 将图片 resize 到画布尺寸
+            canvas = self._flowmap_tab.canvas
+            cw, ch = canvas._cw, canvas._ch
+            if w != cw or h != ch:
+                img = img.resize((cw, ch), Image.LANCZOS)
+
+            # 将 RGB packed 格式解码为 float32 法线向量
+            # packed: r = x*0.5+0.5, g = y*0.5+0.5, b = z*0.5+0.5
+            # 解码: x = r/255*2-1, y = g/255*2-1, z = b/255*2-1
+            arr = np.array(img, dtype=np.float32) / 255.0
+            nm = arr * 2.0 - 1.0  # HxWx3, 值域 [-1, 1]
+
+            # UE4 导出的法线贴图是 DirectX 格式（G 通道翻转，Y 轴朝下）
+            # 如果当前画布是 DirectX 模式，需要翻转 G 通道回来
+            # 因为 canvas.normal_map 存储的是标准法线向量（Y 轴朝上）
+            # DirectX 格式的 G 通道 = -Y，所以需要翻转
+            if canvas.mode_dx:
+                nm[:, :, 1] = -nm[:, :, 1]
+
+            # normalize 确保向量长度为 1
+            length = np.sqrt(np.sum(nm ** 2, axis=2, keepdims=True))
+            length = np.maximum(length, 1e-6)
+            nm = nm / length
+
+            # 保存 undo 快照，然后写入 normal_map
+            canvas._push_undo()
+            canvas.normal_map = nm
+            canvas._flow_cache_dirty = True
+            canvas._normal_vis_dirty = True
+            canvas.update()
+
+            # 通知左侧结果区更新
+            if canvas.on_normal_updated:
+                canvas.on_normal_updated(canvas.normal_map)
+
+            # 自动打开"显示全图"以便用户查看导入的法线图
+            self._flowmap_tab.chk_show_all.setChecked(True)
+        except Exception as e:
+            self.statusBar().showMessage(f"UE4 法线贴图加载失败: {e}", 5000)
+
     # ---------------- file ----------------
     def load_image(self, path: str):
         try:
             img = Image.open(path).convert("RGBA")
             self.src_path = path
+
+            # 本地打开新图片时，清除贴图修改 Tab 的 UE4 来源信息（断开与 UE4 原始资产的关联）
+            # 注意：从 UE4 导入时，_load_from_ue4 会在 load_image 之后重新设置来源信息
+            self._ue4_source_info_per_tab.pop(0, None)
 
             self.source_color = img
             self.master_color = img.copy()
@@ -2339,29 +1763,11 @@ class MainWindow(QMainWindow):
             return f"T_{tag}"
         return self.original_base()
 
-    # ===== 导出路径记忆 =====
-    def _get_export_dir_cache_path(self) -> str:
-        appdata = os.getenv("APPDATA") or ""
-        folder = os.path.join(appdata, "GUITextureEditor")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "last_export_dir.txt")
+    # ===== 导出路径记忆（继承自 ExportDirMixin）=====
+    _export_dir_cache_name = "last_export_dir.txt"
 
-    def _load_last_export_dir(self) -> str:
-        try:
-            with open(self._get_export_dir_cache_path(), "r", encoding="utf-8") as f:
-                d = f.read().strip()
-                if d and os.path.isdir(d):
-                    return d
-        except Exception:
-            pass
+    def _get_default_export_dir(self) -> str:
         return os.path.dirname(self.src_path) if self.src_path else ""
-
-    def _save_last_export_dir(self, path: str):
-        try:
-            with open(self._get_export_dir_cache_path(), "w", encoding="utf-8") as f:
-                f.write(os.path.dirname(path))
-        except Exception:
-            pass
 
     # ===== 历史命名系统 =====
     def get_history_path(self) -> str:
@@ -2413,6 +1819,12 @@ class MainWindow(QMainWindow):
     def update_name_preview(self):
         if not self.src_path:
             self.name_preview.setText("预览：-")
+            return
+        # 优先显示 UE4 来源名称（如果有且用户未手动命名）
+        tab0_source = self._ue4_source_info_per_tab.get(0)
+        if not self.output_basename and tab0_source and tab0_source.get("asset_name"):
+            ue4_name = tab0_source["asset_name"]
+            self.name_preview.setText(f"预览：{ue4_name}（UE4 原始名称）")
             return
         preview = self.compute_preview_basename()
         locked = "（已应用）" if self.output_basename else "（未应用）"
@@ -2610,15 +2022,265 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败：\n{e}")
 
+    # ---------------- UE4 联动 ----------------
+    def _get_ue4_target_path_cache(self, tab_idx: int = 0) -> str:
+        """UE4 目标路径缓存文件路径（按 Tab 索引独立存储）"""
+        appdata = os.getenv("APPDATA") or ""
+        folder = os.path.join(appdata, "GUITextureEditor")
+        os.makedirs(folder, exist_ok=True)
+        # Tab 0 保持原文件名兼容旧版本，其他 Tab 加后缀
+        if tab_idx == 0:
+            return os.path.join(folder, "ue4_target_path.txt")
+        return os.path.join(folder, f"ue4_target_path_tab{tab_idx}.txt")
+
+    def _load_ue4_target_path(self, tab_idx: int = 0) -> str:
+        """加载上次保存的 UE4 目标路径（按 Tab 索引）"""
+        try:
+            with open(self._get_ue4_target_path_cache(tab_idx), "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _save_ue4_target_path(self, tab_idx: int, path: str):
+        """保存 UE4 目标路径（按 Tab 索引）"""
+        try:
+            with open(self._get_ue4_target_path_cache(tab_idx), "w", encoding="utf-8") as f:
+                f.write(path)
+        except Exception:
+            pass
+
+    # ── 贴图修改 tab 的 UE4 联动接口 ──────────────────────────────────
+    def get_ue4_export_image(self) -> Optional[Image.Image]:
+        """贴图修改 tab：返回当前预览图（带亮度/对比度），没有则返回 None。"""
+        return self.preview_img
+
+    def get_ue4_export_name(self) -> str:
+        """贴图修改 tab：返回导出到 UE4 时的资产名称。
+        优先级：用户手动命名 > UE4 来源名称 > 文件原始名称
+        """
+        # 如果用户手动应用了命名，优先使用
+        if self.output_basename:
+            return self.output_basename
+        # 如果有 UE4 来源信息（贴图修改 Tab），使用原始资产名称
+        tab0_source = self._ue4_source_info_per_tab.get(0)
+        if tab0_source and tab0_source.get("asset_name"):
+            return tab0_source["asset_name"]
+        # 兜底：使用文件原始名称
+        return self.original_base()
+
+    # ── Tab 切换回调 ──────────────────────────────────────────────────
+    def _on_tab_changed(self, index: int):
+        """Tab 切换时：保存离开 Tab 的路径 → 恢复目标 Tab 的路径 → 更新按钮状态。"""
+        # 保存离开 Tab 的当前路径（用户可能手动修改了路径文本框）
+        prev_idx = getattr(self, '_prev_tab_idx', None)
+        if prev_idx is not None:
+            current_text = self.ue4_target_path.text().strip()
+            if current_text:
+                self._ue4_target_path_per_tab[prev_idx] = current_text
+
+        # 恢复目标 Tab 的 UE4 目标路径（如果有独立存储的路径）
+        saved_path = self._ue4_target_path_per_tab.get(index, "")
+        if saved_path:
+            self.ue4_target_path.setText(saved_path)
+
+        # 记录当前 Tab 索引，供下次切换时保存路径
+        self._prev_tab_idx = index
+        self._update_ue4_btn_state()
+
+    def _update_ue4_btn_state(self):
+        """根据当前 tab 是否有可导出图片来更新 UE4 按钮状态。"""
+        tab_widget = self._get_current_ue4_tab()
+        if tab_widget is None:
+            # 全能看图 tab 没有导出功能
+            self.btn_export_ue4.setEnabled(False)
+            self.btn_export_ue4.setToolTip("当前页签不支持导入 UE4")
+        else:
+            self.btn_export_ue4.setEnabled(True)
+            self.btn_export_ue4.setToolTip("")
+
+    def _get_current_ue4_tab(self):
+        """
+        获取当前 tab 对应的 UE4 联动对象。
+        贴图修改 tab 返回 self（MainWindow），其他 tab 返回 tab 实例。
+        全能看图 tab 返回 None（不支持导出）。
+        """
+        idx = self._tabs.currentIndex()
+        if idx == 0:
+            return self  # 贴图修改 tab，接口在 MainWindow 上
+        elif idx == 1:
+            return self._sprite_tab
+        elif idx == 2:
+            return self._flowmap_tab
+        elif idx == 3:
+            return self._growth_tab
+        else:
+            return None  # 全能看图 tab，不支持
+
+    def export_to_ue4(self):
+        """将当前 tab 的图片导入到 UE4（所有 tab 共享此方法）"""
+        # 获取当前 tab 的 UE4 联动对象
+        tab_obj = self._get_current_ue4_tab()
+        if tab_obj is None:
+            QMessageBox.warning(self, "提示", "当前页签不支持导入 UE4")
+            return
+
+        # 获取可导出图片
+        export_img = tab_obj.get_ue4_export_image()
+        if export_img is None:
+            QMessageBox.warning(self, "提示", "当前没有可导出的图片，请先生成或导入内容")
+            return
+
+        export_name = tab_obj.get_ue4_export_name()
+
+        # 如果当前 Tab 有 UE4 来源信息，优先使用来源名称作为导出名称
+        # （从 UE4 导入的图片，导出时默认覆盖回原资产）
+        current_tab_idx = self._tabs.currentIndex()
+        current_source_info = self._ue4_source_info_per_tab.get(current_tab_idx)
+        if current_source_info and current_source_info.get("asset_name"):
+            # 只有当 Tab 自身没有用户主动设置的名称时，才用来源名称
+            # 贴图修改 Tab 的 get_ue4_export_name 已经内部处理了来源名称优先级
+            # 其他 Tab：检查是否有用户主动设置的 _output_basename
+            if current_tab_idx != 0:  # 非贴图修改 Tab
+                tab_has_custom_name = getattr(tab_obj, '_output_basename', None)
+                if not tab_has_custom_name:
+                    export_name = current_source_info["asset_name"]
+
+        # 获取 UE4 目标路径
+        target_path = self.ue4_target_path.text().strip()
+        if not target_path:
+            QMessageBox.warning(self, "提示", "请填写 UE4 目标路径（如 /Game/Art/UI/Textures）")
+            return
+
+        if not target_path.startswith("/Game"):
+            QMessageBox.warning(self, "提示", "UE4 路径必须以 /Game 开头")
+            return
+
+        # ── UE4 来源信息检查：改名警告 + 路径变更检测 ──
+        # 复用前面已获取的 current_source_info（按当前 Tab 索引独立）
+        if current_source_info:
+            source_name = current_source_info.get("asset_name", "")
+            source_path = current_source_info.get("asset_path", "")
+
+            name_changed = source_name and export_name != source_name
+            path_changed = source_path and target_path != source_path
+
+            if name_changed or path_changed:
+                # 构建提示信息
+                msg_parts = []
+                if name_changed:
+                    msg_parts.append(f"• 资产名称已更改：{source_name} → {export_name}")
+                if path_changed:
+                    msg_parts.append(f"• 目标路径已更改：{source_path} → {target_path}")
+
+                msg = (
+                    "检测到导出信息与 UE4 原始来源不同：\n\n"
+                    + "\n".join(msg_parts) + "\n\n"
+                    "⚠️ 使用新名称/路径导出将创建新资产，原资产仍保留在 UE4 中。\n"
+                    "如果使用 Perforce，请注意手动处理原资产，避免服务器残留。\n\n"
+                    "请选择导出方式："
+                )
+
+                box = QMessageBox(self)
+                box.setWindowTitle("导出确认")
+                box.setText(msg)
+                box.setIcon(QMessageBox.Warning)
+                btn_original = box.addButton(
+                    f"覆盖原资产（{source_name}）", QMessageBox.AcceptRole)
+                btn_new = box.addButton(
+                    "使用当前设置导出", QMessageBox.DestructiveRole)
+                btn_cancel = box.addButton("取消", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_original)
+                box.exec_()
+
+                clicked = box.clickedButton()
+                if clicked == btn_cancel:
+                    return
+                elif clicked == btn_original:
+                    # 使用原始名称和路径覆盖
+                    export_name = source_name
+                    target_path = source_path
+                    self.ue4_target_path.setText(source_path)
+                elif clicked == btn_new:
+                    # 用户确认使用新名称/路径，清除当前 Tab 的来源信息（后续不再弹窗）
+                    self._ue4_source_info_per_tab.pop(current_tab_idx, None)
+
+        # 保存路径（按当前 Tab 索引独立存储）
+        self._ue4_target_path_per_tab[current_tab_idx] = target_path
+        self._save_ue4_target_path(current_tab_idx, target_path)
+
+        # 检查同步管理器
+        sync_mgr = get_sync_manager()
+        if not sync_mgr.is_running():
+            sync_mgr.start()
+
+        if not sync_mgr.is_ue4_available():
+            QMessageBox.warning(
+                self, "UE4 未就绪",
+                "无法找到 UE4 Sync 目录。\n"
+                "请确认：\n"
+                "1. UE4 编辑器已启动\n"
+                "2. AssetWorkflowToolkit 插件已加载\n"
+                "3. 皮皮联动功能已启用"
+            )
+            return
+
+        # 导出 PNG 到临时文件
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="pipi_ue4_")
+        png_path = os.path.join(tmp_dir, f"{export_name}.png")
+
+        try:
+            # 确保导出为 RGB/RGBA 格式，UE4 不一定能正确处理单通道灰度 PNG
+            if export_img.mode == "L":
+                export_img = export_img.convert("RGB")
+            elif export_img.mode == "LA":
+                export_img = export_img.convert("RGBA")
+            export_img.save(png_path, "PNG")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出临时 PNG 失败：\n{e}")
+            return
+
+        # 发送导入请求
+        self.btn_export_ue4.setEnabled(False)
+        self.btn_export_ue4.setText("正在导入...")
+        QApplication.processEvents()
+
+        try:
+            success, message = sync_mgr.send_import_request(
+                png_path=png_path,
+                target_path=target_path,
+                asset_name=export_name,
+            )
+
+            if success:
+                QMessageBox.information(self, "导入成功", f"贴图已导入 UE4：\n{target_path}/{export_name}")
+            else:
+                QMessageBox.warning(self, "导入失败", f"{message}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导入 UE4 时出错：\n{e}")
+        finally:
+            self.btn_export_ue4.setEnabled(True)
+            self.btn_export_ue4.setText("导入UE4")
+
+            # 清理临时文件
+            try:
+                if os.path.exists(png_path):
+                    os.remove(png_path)
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
     def _reposition_bug_btn(self):
-        """将 bug 按钮固定在窗口左下角（tab bar 列的底部）"""
+        """将 bug 按钮固定在窗口左下角（tab bar 列的底部，UE4 联动栏上方）"""
         if not hasattr(self, '_bug_btn'):
             return
         tab_bar = self._tabs.tabBar()
         bar_pos = tab_bar.mapTo(self, QPoint(0, 0))
         btn = self._bug_btn
+        # 计算 UE4 联动栏高度，确保 bug 按钮始终在其上方
+        ue4_bar_h = self._ue4_bar.height() if hasattr(self, '_ue4_bar') else 0
         x = bar_pos.x() + (tab_bar.width() - btn.width()) // 2
-        y = self.height() - btn.height() - 10
+        y = self.height() - btn.height() - 10 - ue4_bar_h
         btn.move(x, y)
         btn.raise_()
 
@@ -2646,6 +2308,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭时，确保后台线程安全结束，防止退出崩溃"""
+        # 停止 UE4 同步（释放 Named Mutex）
+        try:
+            sync_mgr = get_sync_manager()
+            if sync_mgr.is_running():
+                sync_mgr.stop()
+        except Exception:
+            pass
+
+        # 先统一发送停止信号，让所有后台线程尽快退出
+        if hasattr(self, '_stop_event'):
+            self._stop_event.set()
+
         # 等待更新检查线程结束
         if hasattr(self, '_update_thread') and self._update_thread is not None:
             if self._update_thread.isRunning():
@@ -2653,8 +2327,6 @@ class MainWindow(QMainWindow):
                 self._update_thread.wait(3000)
         # 等待下载线程结束
         if hasattr(self, '_dl_thread') and self._dl_thread is not None:
-            if hasattr(self, '_stop_event'):
-                self._stop_event.set()
             if self._dl_thread.isRunning():
                 self._dl_thread.quit()
                 self._dl_thread.wait(3000)

@@ -6,6 +6,8 @@ from typing import List, Optional, Callable, Tuple, Set
 
 from PIL import Image
 
+from export_dir_mixin import ExportDirMixin
+
 from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression
 from PySide6.QtGui import (
     QRegularExpressionValidator,
@@ -648,7 +650,9 @@ class SheetPreviewLabel(QLabel):
         # 回调：用“插入位置”而不是 cell index
         self.on_reorder_multi(src, ins)
         event.acceptProposedAction()
-class SpriteSheetTab(QWidget):
+class SpriteSheetTab(ExportDirMixin, QWidget):
+    _export_dir_cache_name = "sprite_last_export_dir.txt"
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -1115,6 +1119,8 @@ class SpriteSheetTab(QWidget):
         return [int(p) if p.isdigit() else p for p in parts]
 
     def add_paths(self, new_paths: List[str]):
+        MAX_FRAMES = 256  # 精灵图最大帧数上限，防止内存溢出
+
         uniq: List[str] = []
         existed = set(self.paths)
         for p in new_paths:
@@ -1125,6 +1131,23 @@ class SpriteSheetTab(QWidget):
 
         if not uniq:
             return
+
+        # 帧数上限检查
+        remaining = MAX_FRAMES - len(self.paths)
+        if remaining <= 0:
+            QMessageBox.warning(
+                self, "帧数已达上限",
+                f"精灵图最多支持 {MAX_FRAMES} 帧，当前已有 {len(self.paths)} 帧，无法继续添加。"
+            )
+            return
+        if len(uniq) > remaining:
+            QMessageBox.warning(
+                self, "帧数超出上限",
+                f"精灵图最多支持 {MAX_FRAMES} 帧。\n"
+                f"当前已有 {len(self.paths)} 帧，本次尝试添加 {len(uniq)} 帧。\n"
+                f"将只导入前 {remaining} 张。"
+            )
+            uniq = uniq[:remaining]
 
         # 按文件名自然排序（支持 1,2,3...10,11 数字顺序）
         uniq.sort(key=self._natural_sort_key)
@@ -1754,29 +1777,20 @@ class SpriteSheetTab(QWidget):
 
 
 
+    # ── UE4 联动接口 ──────────────────────────────────────────────────
+    def get_ue4_export_image(self) -> Optional[Image.Image]:
+        """返回当前精灵图可导出到 UE4 的 PIL Image（RGBA），没有则返回 None。"""
+        if self.sheet_rgba is None:
+            return None
+        out_w, out_h = self._get_export_size()
+        return self.sheet_rgba.resize((out_w, out_h), resample=Image.LANCZOS)
+
+    def get_ue4_export_name(self) -> str:
+        """返回导出到 UE4 时的资产名称。"""
+        return self.get_export_basename()
+
     # ---------------- export ----------------
-    def _get_export_dir_cache_path(self) -> str:
-        appdata = os.getenv("APPDATA") or ""
-        folder = os.path.join(appdata, "GUITextureEditor")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "sprite_last_export_dir.txt")
-
-    def _load_last_export_dir(self) -> str:
-        try:
-            with open(self._get_export_dir_cache_path(), "r", encoding="utf-8") as f:
-                d = f.read().strip()
-                if d and os.path.isdir(d):
-                    return d
-        except Exception:
-            pass
-        return ""
-
-    def _save_last_export_dir(self, path: str):
-        try:
-            with open(self._get_export_dir_cache_path(), "w", encoding="utf-8") as f:
-                f.write(os.path.dirname(path))
-        except Exception:
-            pass
+    # 导出路径记忆继承自 ExportDirMixin，无需重复定义
 
     def export_sheet(self):
         if self.sheet_rgba is None:

@@ -20,6 +20,8 @@ import os, math
 import numpy as np
 from typing import Optional, Tuple
 
+from export_dir_mixin import ExportDirMixin
+
 from PIL import Image
 
 from PySide6.QtCore import (
@@ -1064,8 +1066,9 @@ class VectorResultWidget(QWidget):
         return pix.scaled(pw, ph, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
 # ── 主 Tab ────────────────────────────────────────────────────────────
-class FlowMapTab(QWidget):
+class FlowMapTab(ExportDirMixin, QWidget):
     """向量场贴图编辑器 Tab（法线绘制）"""
+    _export_dir_cache_name = "flowmap_last_export_dir.txt"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1630,29 +1633,21 @@ class FlowMapTab(QWidget):
             return os.path.splitext(os.path.basename(self._src_path))[0] + "_N"
         return "FlowMap"
 
-    # ── 导出路径记忆 ──────────────────────────────────────────────────
-    def _get_export_dir_cache_path(self) -> str:
-        appdata = os.getenv("APPDATA") or ""
-        folder = os.path.join(appdata, "GUITextureEditor")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "flowmap_last_export_dir.txt")
-
-    def _load_last_export_dir(self) -> str:
-        try:
-            with open(self._get_export_dir_cache_path(), "r", encoding="utf-8") as f:
-                d = f.read().strip()
-                if d and os.path.isdir(d):
-                    return d
-        except Exception:
-            pass
+    # ── 导出路径记忆（继承自 ExportDirMixin）──────────────────────────
+    def _get_default_export_dir(self) -> str:
         return os.path.dirname(self._src_path) if self._src_path else ""
 
-    def _save_last_export_dir(self, path: str):
-        try:
-            with open(self._get_export_dir_cache_path(), "w", encoding="utf-8") as f:
-                f.write(os.path.dirname(path))
-        except Exception:
-            pass
+    # ── UE4 联动接口 ──────────────────────────────────────────────────
+    def get_ue4_export_image(self) -> Optional[Image.Image]:
+        """返回当前法线图可导出到 UE4 的 PIL Image（RGB），没有则返回 None。"""
+        mode_dx = self.combo_normal_mode.currentIndex() == 0
+        return self.canvas.get_export_image(
+            mode_dx=mode_dx, target_size=self._target_size
+        )
+
+    def get_ue4_export_name(self) -> str:
+        """返回导出到 UE4 时的资产名称。"""
+        return self._get_export_name()
 
     # ── 导出 ──────────────────────────────────────────────────────────
     def _export(self):

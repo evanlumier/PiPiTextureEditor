@@ -9,10 +9,174 @@ growth_algorithms.py
 
 import os
 import re
+import threading
+import functools
 from typing import List, Tuple, Iterator, Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
+
+# ─────────────────────────────────────────────────────────────────────
+# 内存安全和验证工具
+# ─────────────────────────────────────────────────────────────────────
+
+def memory_safe(threshold=85):
+    """
+    内存安全装饰器，防止内存使用过高导致系统崩溃
+    
+    参数:
+        threshold - 内存使用率阈值（百分比），默认85%
+    
+    使用示例:
+        @memory_safe(threshold=80)
+        def process_large_image(image_data):
+            # 图像处理逻辑
+            pass
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                import psutil
+                mem_percent = psutil.virtual_memory().percent
+                if mem_percent > threshold:
+                    raise MemoryError(
+                        f"系统内存使用率已达{mem_percent:.1f}%，超过安全阈值{threshold}%。"
+                        "请关闭其他程序或使用较小的图像。"
+                    )
+            except ImportError:
+                # psutil不可用时跳过内存检查
+                pass
+            
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def validate_image_data(image, expected_shape=None, allow_none=False):
+    """
+    验证图像数据的完整性和有效性
+    
+    参数:
+        image - 要验证的图像数据（PIL Image或numpy数组）
+        expected_shape - 期望的图像形状（可选）
+        allow_none - 是否允许image为None
+    
+    返回:
+        bool - 验证通过返回True
+    
+    抛出:
+        ValueError - 图像数据无效时抛出
+    """
+    if image is None:
+        if allow_none:
+            return True
+        raise ValueError("图像数据为空")
+    
+    # 检查PIL Image
+    if isinstance(image, Image.Image):
+        if image.size[0] <= 0 or image.size[1] <= 0:
+            raise ValueError("图像尺寸无效")
+        return True
+    
+    # 检查numpy数组
+    if isinstance(image, np.ndarray):
+        if not hasattr(image, 'shape'):
+            raise ValueError("无效的图像格式")
+        
+        if len(image.shape) not in [2, 3]:
+            raise ValueError(f"不支持的图像维度: {len(image.shape)}")
+        
+        if image.shape[0] <= 0 or image.shape[1] <= 0:
+            raise ValueError("图像尺寸无效")
+        
+        # 检查数据范围
+        if np.any(np.isnan(image)):
+            raise ValueError("图像包含NaN值")
+        
+        if np.any(np.isinf(image)):
+            raise ValueError("图像包含无穷大值")
+        
+        # 检查期望形状
+        if expected_shape and image.shape != expected_shape:
+            raise ValueError(
+                f"图像尺寸不匹配: 期望 {expected_shape}, 实际 {image.shape}"
+            )
+        
+        return True
+    
+    raise ValueError(f"不支持的图像类型: {type(image)}")
+
+
+def safe_path_operation(path, operation_func, description="文件操作"):
+    """
+    安全的路径操作包装器
+    
+    参数:
+        path - 要操作的路径
+        operation_func - 操作函数
+        description - 操作描述（用于错误信息）
+    
+    返回:
+        operation_func的返回值
+    
+    抛出:
+        ValueError - 路径不安全或操作失败时抛出
+    """
+    if not path:
+        raise ValueError("路径不能为空")
+    
+    try:
+        # 规范化路径，处理特殊字符
+        safe_path = os.path.normpath(os.path.expanduser(str(path)))
+        
+        # 检查路径安全性
+        if '..' in safe_path.split(os.sep):
+            raise ValueError("路径包含不安全的上级目录引用")
+        
+        return operation_func(safe_path)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{description}失败: {safe_path} - {str(e)}")
+    except Exception as e:
+        raise ValueError(f"{description}发生意外错误: {str(e)}")
+
+
+class ThreadSafeResource:
+    """
+    线程安全的资源管理器
+    
+    用于管理需要在多个线程间共享的资源，确保线程安全
+    """
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._resources = {}
+    
+    def acquire(self, resource_id, creator_func):
+        """获取或创建资源"""
+        with self._lock:
+            if resource_id not in self._resources:
+                self._resources[resource_id] = creator_func()
+            return self._resources[resource_id]
+    
+    def release(self, resource_id):
+        """释放指定资源"""
+        with self._lock:
+            if resource_id in self._resources:
+                resource = self._resources.pop(resource_id)
+                if hasattr(resource, 'close'):
+                    resource.close()
+    
+    def release_all(self):
+        """释放所有资源"""
+        with self._lock:
+            for resource_id, resource in list(self._resources.items()):
+                if hasattr(resource, 'close'):
+                    resource.close()
+                del self._resources[resource_id]
+
+
+# 全局线程安全资源管理器实例
+_thread_safe_resources = ThreadSafeResource()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -47,7 +211,7 @@ def rgba_to_presence_map(
         "auto"       — 先做单帧判定（alpha 不全为 255 时用 alpha，否则用 luminance）；
                        若调用方已通过跨帧分析确定了更优模式，可用 _force_mode 覆盖。
         "alpha"      — 强制使用 alpha 通道 / 255
-        "luminance"  — 强制使用 0.299R + 0.587G + 0.114B，归一化到 0~1
+        "luminance" — 强制使用 0.299R + 0.587G + 0.114B，归一化到 0~1
 
     _force_mode:
         仅在 source_mode=="auto" 时生效，由 generate_growth_gray_from_sequence
@@ -59,6 +223,25 @@ def rgba_to_presence_map(
     返回：(presence_map: H×W float32, actual_mode: str)
         actual_mode 为实际使用的模式："alpha" 或 "luminance"
     """
+    # 输入参数验证
+    if img is None:
+        raise ValueError("图像数据为空")
+    
+    if not isinstance(img, Image.Image):
+        raise ValueError(f"不支持的图像类型: {type(img)}")
+    
+    if img.size[0] <= 0 or img.size[1] <= 0:
+        raise ValueError(f"图像尺寸无效: {img.size}")
+    
+    if source_mode not in ("auto", "alpha", "luminance"):
+        raise ValueError(f"不支持的source_mode: {source_mode}")
+    
+    if blur_radius < 0:
+        raise ValueError(f"模糊半径不能为负数: {blur_radius}")
+    
+    if _force_mode and _force_mode not in ("", "alpha", "luminance"):
+        raise ValueError(f"不支持的force_mode: {_force_mode}")
+
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 

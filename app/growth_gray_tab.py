@@ -29,6 +29,8 @@ from typing import Optional, List
 import numpy as np
 from PIL import Image
 
+from export_dir_mixin import ExportDirMixin
+
 from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QRegularExpression, QTimer, QThread, Signal
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QPen, QColor, QCursor,
@@ -745,17 +747,43 @@ class _SeqGenWorker(QThread):
         self._mask_threshold = mask_threshold
         self._invert = invert
         self._force_mode = force_mode
-        self._cancelled = False
+        self._cancel_event = threading.Event()  # 使用Event替代布尔标志，更线程安全
+        self._temp_resources = []  # 临时资源列表，用于清理
 
     def cancel(self):
-        """请求取消生成。"""
-        self._cancelled = True
+        """请求取消生成并清理资源。"""
+        self._cancel_event.set()
+        self._cleanup_resources()
 
     def is_cancelled(self) -> bool:
-        return self._cancelled
+        return self._cancel_event.is_set()
+
+    def _cleanup_resources(self):
+        """清理临时资源，防止内存泄漏。"""
+        for resource in self._temp_resources:
+            try:
+                if hasattr(resource, 'close'):
+                    resource.close()
+                elif hasattr(resource, 'release'):
+                    resource.release()
+            except Exception:
+                pass  # 静默处理清理异常
+        self._temp_resources.clear()
+
+    def _register_resource(self, resource):
+        """注册需要清理的资源。"""
+        self._temp_resources.append(resource)
 
     def run(self):
         try:
+            # 检查内存安全
+            try:
+                import psutil
+                if psutil.virtual_memory().percent > 85:
+                    raise MemoryError("系统内存使用率过高，无法开始生成操作")
+            except ImportError:
+                pass  # psutil不可用时跳过内存检查
+
             result = generate_growth_gray_from_sequence(
                 frame_iter=self._frame_iter,
                 frame_count=self._frame_count,
@@ -766,21 +794,28 @@ class _SeqGenWorker(QThread):
                 invert=self._invert,
                 force_mode=self._force_mode,
                 progress_callback=lambda cur, tot: self.progress.emit(cur, tot),
-                cancel_flag=lambda: self._cancelled,
+                cancel_flag=lambda: self._cancel_event.is_set(),
             )
-            if self._cancelled:
+            
+            if self._cancel_event.is_set():
                 self.cancelled.emit()
             else:
                 self.finished_ok.emit(result)
         except InterruptedError:
             self.cancelled.emit()
+        except MemoryError as e:
+            self.finished_err.emit(f"内存不足: {str(e)}")
         except Exception as ex:
             self.finished_err.emit(str(ex))
+        finally:
+            # 确保无论如何都执行清理
+            self._cleanup_resources()
 
 
 # ── 主 Tab ────────────────────────────────────────────────────────────
-class GrowthGrayTab(QWidget):
+class GrowthGrayTab(ExportDirMixin, QWidget):
     """生长灰度图生成器 Tab"""
+    _export_dir_cache_name = "growth_gray_last_export_dir.txt"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -799,6 +834,7 @@ class GrowthGrayTab(QWidget):
         self._src_path: Optional[str] = None                  # 导入路径（单图）
         self._output_basename: Optional[str] = None           # 导出基础名
         self._seq_generated: bool = False                     # 是否已生成过序列帧灰度图
+        self._pending_regen: bool = False                     # 取消后是否需要自动重新生成
 
         # ── 预览代理缓存（大图加速）──
         self._preview_factor: float = 1.0                     # 预览缩放因子
@@ -809,6 +845,8 @@ class GrowthGrayTab(QWidget):
         self._video_frame_count: int = 0                      # 视频总帧数
         self._video_sample_interval: int = 1                  # 视频帧采样间隔
         self._seq_gen_worker: Optional[_SeqGenWorker] = None  # 序列帧生成后台线程
+        self._is_cancelling: bool = False  # 取消中标志，防止竞态条件
+        self._cancel_timeout_timer: Optional[QTimer] = None  # 取消超时保底 Timer
 
         # ── 防抖 Timer（参数变化后延迟 600ms 自动重新生成）──────────────
         from PySide6.QtCore import QTimer
@@ -2068,9 +2106,47 @@ class GrowthGrayTab(QWidget):
     def _load_single_from_path(self, path: str):
         """从给定路径加载单图（供按钮导入和拖拽导入共用）。"""
         try:
-            img = Image.open(path).convert("RGBA")
+            # 路径安全验证
+            if not path or not isinstance(path, str):
+                raise ValueError("路径无效或为空")
+            
+            # 检查文件存在性和可访问性
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"文件不存在: {path}")
+            
+            if not os.path.isfile(path):
+                raise ValueError(f"路径不是文件: {path}")
+            
+            # 检查文件大小（防止加载空文件或超大文件导致内存溢出）
+            file_size = os.path.getsize(path)
+            if file_size == 0:
+                raise ValueError("文件为空（0 字节），无法作为图像加载")
+            if file_size > 100 * 1024 * 1024:  # 100MB限制
+                raise ValueError(f"文件过大 ({file_size//1024//1024}MB)，请使用较小的图像文件")
+            
+            # 检查文件扩展名（基本格式验证）
+            valid_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.tga'}
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in valid_extensions:
+                raise ValueError(f"不支持的图像格式: {ext}，支持: {', '.join(valid_extensions)}")
+            
+            # 使用安全路径操作加载图像
+            def load_image(safe_path):
+                img = Image.open(safe_path)
+                # 验证图像尺寸
+                if img.width <= 0 or img.height <= 0:
+                    raise ValueError("图像尺寸无效")
+                if img.width > 8192 or img.height > 8192:
+                    raise ValueError(f"图像尺寸过大 ({img.width}x{img.height})，最大支持8192x8192")
+                return img.convert("RGBA")
+            
+            img = load_image(path)
+            
+        except (FileNotFoundError, ValueError, OSError) as ex:
+            QMessageBox.warning(self, "导入失败", f"{type(ex).__name__}: {ex}")
+            return
         except Exception as ex:
-            QMessageBox.warning(self, "导入失败", str(ex))
+            QMessageBox.warning(self, "导入失败", f"加载图像时发生意外错误: {ex}")
             return
 
         self.source_image = img
@@ -2334,6 +2410,34 @@ class GrowthGrayTab(QWidget):
     def _load_video_from_path(self, path: str):
         """从指定路径加载视频文件（供按钮导入和拖拽导入共用）。"""
         global _HAS_CV2
+        
+        # 路径安全验证
+        try:
+            if not path or not isinstance(path, str):
+                raise ValueError("路径无效或为空")
+            
+            # 检查文件存在性和可访问性
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"文件不存在: {path}")
+            
+            if not os.path.isfile(path):
+                raise ValueError(f"路径不是文件: {path}")
+            
+            # 检查文件大小（防止加载超大视频导致内存溢出）
+            file_size = os.path.getsize(path)
+            if file_size > 500 * 1024 * 1024:  # 500MB限制
+                raise ValueError(f"视频文件过大 ({file_size//1024//1024}MB)，请使用较小的视频文件")
+            
+            # 检查文件扩展名（基本格式验证）
+            valid_extensions = {'.mp4', '.avi', '.mov', '.webm', '.mkv', '.flv', '.wmv', '.m4v'}
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in valid_extensions:
+                raise ValueError(f"不支持的视频格式: {ext}，支持: {', '.join(valid_extensions)}")
+                
+        except (FileNotFoundError, ValueError, OSError) as ex:
+            QMessageBox.warning(self, "导入失败", f"{type(ex).__name__}: {ex}")
+            return
+        
         if not _HAS_CV2:
             import sys
             if getattr(sys, 'frozen', False):
@@ -2359,39 +2463,66 @@ class GrowthGrayTab(QWidget):
                 if reply == QMessageBox.StandardButton.Ok:
                     self._install_opencv()
             return
+        
         try:
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                raise RuntimeError("无法打开视频文件")
+            # 使用安全路径操作加载视频
+            def load_video(safe_path):
+                cap = cv2.VideoCapture(safe_path)
+                if not cap.isOpened():
+                    raise RuntimeError("无法打开视频文件，可能格式不支持或文件损坏")
 
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total_frames <= 0:
-                raise RuntimeError("视频帧数为 0 或无法读取")
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if total_frames <= 0:
+                    cap.release()
+                    raise RuntimeError("视频帧数为 0 或无法读取，可能文件已损坏")
+                
+                # 获取 fps（在第一次打开时就获取，避免后续二次打开）
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if not fps or fps <= 0:
+                    fps = 0
+                
+                # 检查视频尺寸
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if width <= 0 or height <= 0:
+                    cap.release()
+                    raise ValueError("视频尺寸无效")
+                if width > 8192 or height > 8192:
+                    cap.release()
+                    raise ValueError(f"视频尺寸过大 ({width}x{height})，最大支持8192x8192")
 
-            # 读取首帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, bgr_first = cap.read()
-            if not ret:
-                raise RuntimeError("无法读取视频首帧")
-            first_frame = self._cv2_to_pil(bgr_first)
-
-            # 读取尾帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
-            ret, bgr_last = cap.read()
-            if not ret:
-                # 某些视频 seek 到最后一帧可能失败，尝试倒退几帧
-                for offset in range(2, min(10, total_frames)):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - offset)
-                    ret, bgr_last = cap.read()
-                    if ret:
-                        break
+                # 读取首帧
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, bgr_first = cap.read()
                 if not ret:
-                    bgr_last = bgr_first  # fallback 到首帧
-            last_frame = self._cv2_to_pil(bgr_last)
+                    cap.release()
+                    raise RuntimeError("无法读取视频首帧，可能文件已损坏")
+                first_frame = self._cv2_to_pil(bgr_first)
 
-            cap.release()
+                # 读取尾帧
+                cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+                ret, bgr_last = cap.read()
+                if not ret:
+                    # 某些视频 seek 到最后一帧可能失败，尝试倒退几帧
+                    for offset in range(2, min(10, total_frames)):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - offset)
+                        ret, bgr_last = cap.read()
+                        if ret:
+                            break
+                    if not ret:
+                        bgr_last = bgr_first  # fallback 到首帧
+                last_frame = self._cv2_to_pil(bgr_last)
+
+                cap.release()
+                return total_frames, first_frame, last_frame, width, height, fps
+            
+            total_frames, first_frame, last_frame, width, height, fps = load_video(path)
+            
+        except (RuntimeError, ValueError) as ex:
+            QMessageBox.warning(self, "导入失败", f"{type(ex).__name__}: {ex}")
+            return
         except Exception as ex:
-            QMessageBox.warning(self, "导入失败", str(ex))
+            QMessageBox.warning(self, "导入失败", f"加载视频时发生意外错误: {ex}")
             return
 
         # 保存视频信息
@@ -2441,15 +2572,6 @@ class GrowthGrayTab(QWidget):
             self.spin_video_sample.setValue(2)
         else:
             self.spin_video_sample.setValue(1)
-
-        # 重新打开获取 fps（cap 已在 try 块中 release）
-        fps = 0
-        try:
-            cap2 = cv2.VideoCapture(path)
-            fps = cap2.get(cv2.CAP_PROP_FPS)
-            cap2.release()
-        except Exception:
-            fps = 0
 
         duration = total_frames / fps if fps > 0 else 0
         info_parts = [f"🎬 {os.path.basename(path)}"]
@@ -2531,6 +2653,9 @@ class GrowthGrayTab(QWidget):
 
     # ── 序列帧自动生成 ─────────────────────────────────────────────────
     def _generate_from_sequence(self):
+        # 如果正在取消中，忽略（防止竞态条件）
+        if self._is_cancelling:
+            return
         # 如果已有后台线程在运行，忽略重复点击
         if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
             return
@@ -2599,11 +2724,21 @@ class GrowthGrayTab(QWidget):
         worker.start()
 
     def _cancel_seq_generation(self):
-        """用户点击取消按钮。"""
+        """用户点击取消按钮，安全停止后台线程（协作式取消，不使用 terminate）。"""
         if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
+            self._is_cancelling = True
+            # 发送取消信号（协作式，worker 会在下一个检查点退出）
             self._seq_gen_worker.cancel()
             self.lbl_seq_status.setText("正在取消…")
             self.btn_cancel_seq.setEnabled(False)
+            self.btn_generate_seq.setEnabled(False)  # 取消期间也禁用生成按钮
+
+            # 超时保底：10 秒后如果 cancelled 信号还没来，强制恢复 UI
+            if self._cancel_timeout_timer is None:
+                self._cancel_timeout_timer = QTimer(self)
+                self._cancel_timeout_timer.setSingleShot(True)
+                self._cancel_timeout_timer.timeout.connect(self._on_cancel_timeout)
+            self._cancel_timeout_timer.start(10000)
 
     def _on_seq_gen_progress(self, current: int, total: int):
         """后台线程进度回调（通过信号在主线程执行）。"""
@@ -2611,24 +2746,56 @@ class GrowthGrayTab(QWidget):
             self.lbl_seq_status.setText(f"计算中… {current}/{total} 帧")
 
     def _on_seq_gen_finished(self, result: dict):
-        """后台线程生成完成回调。"""
-        # 恢复 UI 状态
-        self.btn_generate_seq.setEnabled(True)
-        self.btn_cancel_seq.setVisible(False)
-        self.btn_cancel_seq.setEnabled(True)
-        self._seq_gen_worker = None
+        """后台线程生成完成回调，包含内存清理和资源管理。"""
+        try:
+            # 停止取消超时 timer 并重置取消状态（防止取消信号与完成信号竞态）
+            self._is_cancelling = False
+            if self._cancel_timeout_timer:
+                self._cancel_timeout_timer.stop()
 
-        # 写入核心数据
-        self.gray_map = result["gray_map"]
-        self.base_gray_map = result["gray_map"].copy()  # 保留原始基础灰度图
-        self.mask_map = result["mask_map"]
-        # 重置噪波叠加结果（基础图已更新）
-        self.final_gray_map = None
-        self.noise_map = None
+            # 恢复 UI 状态
+            self.btn_generate_seq.setEnabled(True)
+            self.btn_cancel_seq.setVisible(False)
+            self.btn_cancel_seq.setEnabled(True)
+            
+            # 清理工作线程引用
+            if self._seq_gen_worker:
+                self._seq_gen_worker = None
 
-        # source_image 已在导入时设为尾帧，无需再更新
-        # 释放可能残留的帧列表
-        self.sequence_frames = []
+            # 写入核心数据前先清理旧数据
+            if hasattr(self, 'gray_map') and self.gray_map is not None:
+                del self.gray_map
+            if hasattr(self, 'base_gray_map') and self.base_gray_map is not None:
+                del self.base_gray_map
+            if hasattr(self, 'mask_map') and self.mask_map is not None:
+                del self.mask_map
+            
+            # 写入新的核心数据
+            self.gray_map = result["gray_map"]
+            self.base_gray_map = result["gray_map"].copy()  # 保留原始基础灰度图
+            self.mask_map = result["mask_map"]
+            
+            # 重置噪波叠加结果（基础图已更新）
+            if hasattr(self, 'final_gray_map') and self.final_gray_map is not None:
+                del self.final_gray_map
+            if hasattr(self, 'noise_map') and self.noise_map is not None:
+                del self.noise_map
+            self.final_gray_map = None
+            self.noise_map = None
+
+            # source_image 已在导入时设为尾帧，无需再更新
+            # 释放可能残留的帧列表
+            if hasattr(self, 'sequence_frames') and self.sequence_frames:
+                self.sequence_frames.clear()
+                self.sequence_frames = []
+                
+            # 强制垃圾回收大内存对象
+            import gc
+            gc.collect()
+            
+        except Exception as e:
+            # 即使清理过程出错也不影响主要功能
+            print(f"资源清理过程中出现异常: {e}")
 
         # 更新左栏预览
         bw_px = np_mask_to_qpixmap(self.mask_map)
@@ -2705,21 +2872,73 @@ class GrowthGrayTab(QWidget):
         self._seq_generated = True  # 标记已生成过，后续参数变化可自动刷新
 
     def _on_seq_gen_error(self, err_msg: str):
-        """后台线程生成失败回调。"""
-        self.btn_generate_seq.setEnabled(True)
-        self.btn_cancel_seq.setVisible(False)
-        self.btn_cancel_seq.setEnabled(True)
-        self._seq_gen_worker = None
-        QMessageBox.warning(self, "生成失败", err_msg)
-        self.lbl_seq_status.setText("生成失败")
+        """后台线程生成失败回调，包含资源清理和内存管理。"""
+        try:
+            # 停止取消超时 timer 并重置取消状态（防止取消信号与完成信号竞态）
+            self._is_cancelling = False
+            if self._cancel_timeout_timer:
+                self._cancel_timeout_timer.stop()
+
+            # 恢复 UI 状态
+            self.btn_generate_seq.setEnabled(True)
+            self.btn_cancel_seq.setVisible(False)
+            self.btn_cancel_seq.setEnabled(True)
+            
+            # 清理工作线程引用
+            if self._seq_gen_worker:
+                self._seq_gen_worker = None
+            
+            # 清理可能存在的部分生成结果
+            if hasattr(self, 'gray_map') and self.gray_map is not None:
+                del self.gray_map
+            if hasattr(self, 'base_gray_map') and self.base_gray_map is not None:
+                del self.base_gray_map
+            if hasattr(self, 'mask_map') and self.mask_map is not None:
+                del self.mask_map
+            if hasattr(self, 'final_gray_map') and self.final_gray_map is not None:
+                del self.final_gray_map
+            if hasattr(self, 'noise_map') and self.noise_map is not None:
+                del self.noise_map
+            
+            # 重置所有图像数据
+            self.gray_map = None
+            self.base_gray_map = None
+            self.mask_map = None
+            self.final_gray_map = None
+            self.noise_map = None
+            
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+            
+            # 显示错误信息
+            QMessageBox.warning(self, "生成失败", err_msg)
+            self.lbl_seq_status.setText("生成失败")
+            
+        except Exception as e:
+            # 即使清理过程出错也要显示原始错误信息
+            QMessageBox.warning(self, "生成失败", f"{err_msg}\n\n清理资源时出现异常: {e}")
+            self.lbl_seq_status.setText("生成失败（资源清理异常）")
 
     def _on_seq_gen_cancelled(self):
         """后台线程被取消回调。"""
+        self._is_cancelling = False
+        if self._cancel_timeout_timer:
+            self._cancel_timeout_timer.stop()
         self.btn_generate_seq.setEnabled(True)
         self.btn_cancel_seq.setVisible(False)
         self.btn_cancel_seq.setEnabled(True)
         self._seq_gen_worker = None
         self.lbl_seq_status.setText("已取消生成")
+
+    def _on_cancel_timeout(self):
+        """取消超时保底：10 秒后 worker 仍未响应，强制恢复 UI 状态。"""
+        self._is_cancelling = False
+        self._seq_gen_worker = None
+        self.btn_generate_seq.setEnabled(True)
+        self.btn_cancel_seq.setVisible(False)
+        self.btn_cancel_seq.setEnabled(True)
+        self.lbl_seq_status.setText("取消超时，已强制恢复")
 
     def _schedule_auto_regen(self):
         """参数变化时启动防抖 Timer，600ms 后自动重新生成（仅在已生成过的情况下触发）。"""
@@ -2729,14 +2948,28 @@ class GrowthGrayTab(QWidget):
     def _auto_regen_if_ready(self):
         """防抖 Timer 触发：自动重新生成序列帧灰度图。"""
         if self._seq_generated and (self.sequence_frames or self._seq_file_paths or self._video_path):
-            # 如果后台线程正在运行，先取消旧的
+            # 如果后台线程正在运行，先取消旧的，等取消完成后再重新生成
             if self._seq_gen_worker is not None and self._seq_gen_worker.isRunning():
                 self._seq_gen_worker.cancel()
-                self._seq_gen_worker.wait()
-                self._seq_gen_worker = None
-                self.btn_generate_seq.setEnabled(True)
-                self.btn_cancel_seq.setVisible(False)
-                self.btn_cancel_seq.setEnabled(True)
+                # 标记需要在取消完成后自动重新生成
+                self._pending_regen = True
+                # 连接一次性信号：取消/完成后自动触发重新生成
+                try:
+                    self._seq_gen_worker.cancelled.disconnect(self._on_regen_after_cancel)
+                except (TypeError, RuntimeError):
+                    pass
+                self._seq_gen_worker.cancelled.connect(self._on_regen_after_cancel)
+                return
+            self._generate_from_sequence()
+
+    def _on_regen_after_cancel(self):
+        """旧线程取消完成后，自动触发重新生成（在主线程执行）。"""
+        self._seq_gen_worker = None
+        self.btn_generate_seq.setEnabled(True)
+        self.btn_cancel_seq.setVisible(False)
+        self.btn_cancel_seq.setEnabled(True)
+        if getattr(self, '_pending_regen', False):
+            self._pending_regen = False
             self._generate_from_sequence()
 
     # ── Mask 生成 ──────────────────────────────────────────────────────
@@ -2940,6 +3173,23 @@ class GrowthGrayTab(QWidget):
         power = self.dspin_power.value()
         fallback = self.chk_fallback.isChecked()
         smooth_iter = self.spin_smooth.value()
+
+        # 大图少 seed 性能提示：mask 内像素多但 seed 点少时，计算可能很慢
+        mask_pixels = int((self.mask_map > 0).sum()) if self.mask_map is not None else 0
+        if mask_pixels == 0 and self.source_image is not None:
+            # 无 mask 时，整张图都参与计算
+            w, h = self.source_image.size
+            mask_pixels = w * h
+        if mask_pixels > 1_000_000 and valid_count < 10:
+            reply = QMessageBox.question(
+                self, "性能提示",
+                f"当前图像较大（mask 内约 {mask_pixels:,} 像素），"
+                f"但种子点较少（{valid_count} 个），\n"
+                "计算可能需要较长时间。是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         self.lbl_prop_status.setText("传播计算中，请稍候…")
         QApplication.processEvents()
@@ -3161,38 +3411,65 @@ class GrowthGrayTab(QWidget):
         h = _parse(self.export_size_h.currentText(), orig_h)
         return w, h
 
-    # ── 导出目录记忆 ─────────────────────────────────────────────────
-    def _get_export_dir_cache_path(self) -> str:
-        appdata = os.getenv("APPDATA") or ""
-        folder = os.path.join(appdata, "GUITextureEditor")
-        os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "growth_gray_last_export_dir.txt")
-
-    def _load_last_export_dir(self) -> str:
-        try:
-            with open(self._get_export_dir_cache_path(), "r", encoding="utf-8") as f:
-                d = f.read().strip()
-                if d and os.path.isdir(d):
-                    return d
-        except Exception:
-            pass
+    # ── 导出目录记忆（继承自 ExportDirMixin）─────────────────────────
+    def _get_default_export_dir(self) -> str:
         if self._src_path and os.path.isfile(self._src_path):
             return os.path.dirname(self._src_path)
         elif self._src_path and os.path.isdir(self._src_path):
             return self._src_path
         return ""
+    # ── UE4 联动接口 ──────────────────────────────────────────────────
+    def get_ue4_export_image(self) -> Optional[Image.Image]:
+        """
+        返回当前灰度图可导出到 UE4 的 PIL Image（L 模式），没有则返回 None。
+        策略：启用噪波叠加且有 final_gray_map 时返回叠加后的，否则返回基础灰度图。
+        """
+        # 优先返回叠加噪波后的最终灰度图
+        if (self.chk_noise_enable.isChecked()
+                and self.final_gray_map is not None):
+            gray = self.final_gray_map
+        elif self.gray_map is not None:
+            gray = self.gray_map
+        else:
+            return None
 
-    def _save_last_export_dir(self, path: str):
-        try:
-            with open(self._get_export_dir_cache_path(), "w", encoding="utf-8") as f:
-                f.write(os.path.dirname(path))
-        except Exception:
-            pass
+        u8 = (np.clip(gray, 0.0, 1.0) * 255).astype(np.uint8)
+        out_img = Image.fromarray(u8, mode="L")
+        # 按导出尺寸缩放
+        orig_h, orig_w = gray.shape
+        export_w, export_h = self._get_export_size(orig_h, orig_w)
+        if export_w != orig_w or export_h != orig_h:
+            out_img = out_img.resize((export_w, export_h), Image.BILINEAR)
+        return out_img
+
+    def get_ue4_export_name(self) -> str:
+        """返回导出到 UE4 时的资产名称。"""
+        tag = self.name_input.text().strip()
+        has_noise = (self.chk_noise_enable.isChecked()
+                     and self.final_gray_map is not None)
+        suffix = "_Growth_Noise" if has_noise else "_Growth"
+        if tag:
+            return f"T_{tag}{suffix}"
+        elif self._output_basename:
+            return f"{self._output_basename}{suffix}"
+        return f"Growth{suffix}"
 
     def _export_gray(self):
         if self.gray_map is None or self.source_image is None:
             QMessageBox.information(self, "提示", "请先导入图像并绘制路径。")
             return
+
+        # 检查灰度图是否有有效内容
+        if np.all(self.gray_map == 0):
+            reply = QMessageBox.question(
+                self, "灰度图为空",
+                "当前灰度图全为黑色（无有效内容）。\n"
+                "可能原因：尚未绘制路径或生成序列帧灰度图。\n\n"
+                "是否仍要导出？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         # 确定默认文件名
         tag = self.name_input.text().strip()

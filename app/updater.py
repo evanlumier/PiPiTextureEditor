@@ -890,8 +890,8 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         # bat 脚本会在当前进程退出后执行文件替换
         _progress(50, "正在生成更新脚本...")
 
-        bat_path = os.path.join(tempfile.gettempdir(), "ppeditor_update.bat")
         current_pid = os.getpid()
+        bat_path = os.path.join(tempfile.gettempdir(), f"ppeditor_update_{current_pid}.bat")
 
         # ── 智能检测新版本包结构 ──
         # 如果新版本包中包含 app/ 子目录，说明是拆包架构，只替换 app/
