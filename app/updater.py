@@ -1,12 +1,12 @@
 """
-updater.py —— GitHub Release 在线更新模块
+updater.py —— 工蜂 (GitLab) Release 在线更新模块
 负责：检查新版本、下载 zip、解压替换、重启应用。
 
 适用于 PyInstaller 文件夹模式打包（--onedir），
 Release Asset 为 zip 压缩包。
 
-★ 发布提醒：上传 Release Asset 时请使用英文文件名（如 PPTextureEditor_vX.X.X.zip），
-  避免 PowerShell 下 gh CLI 中文文件名被截断的问题。
+★ 更新源：腾讯工蜂 git.woa.com（公司内网 GitLab）
+★ 发布提醒：上传 Release Asset 时请使用英文文件名（如 PPTextureEditor_vX.X.X.zip）
 """
 
 import os
@@ -29,37 +29,22 @@ from version import __version__
 _log = logging.getLogger("updater")
 
 # ====================================================================
-# ★ 配置区 —— 发布前请修改为你的真实 GitHub 用户名和仓库名 ★
+# ★ 配置区 —— 工蜂 (GitLab) 更新源配置 ★
 # ★ 上传 Release Asset 时请统一使用英文文件名，例如：
 # ★   PPTextureEditor_v0.8.0.zip
-# ★ 不要使用中文文件名，否则 gh CLI 在 PowerShell 中会截断中文部分。
 # ====================================================================
-GITHUB_OWNER = "evanlumier"
-GITHUB_REPO = "PiPiTextureEditor"
-ASSET_SUFFIX = ".zip"                   # Release Asset 必须是 zip
+GITLAB_PROJECT_ID = "1754037"            # 工蜂项目 ID
+GITLAB_HOST = "https://git.woa.com"      # 工蜂地址
+ASSET_SUFFIX = ".zip"                    # Release Asset 必须是 zip
 
-# ── API 地址列表（按优先级排列，依次尝试直到成功）──
-# 官方 GitHub API + 多个国内可用的加速代理站点
+# ── API 地址（工蜂内网直连，无需镜像）──
 _API_URLS = [
-    # ① GitHub 官方
-    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest",
-    # ② gh-proxy.org 代理（国内优化线路）
-    f"https://gh-proxy.org/https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest",
-    # ③ ghfast 代理
-    f"https://ghfast.top/https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest",
-    # ④ gh-proxy.com 代理
-    f"https://gh-proxy.com/https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest",
-    # ⑤ llkk.cc 代理
-    f"https://gh.llkk.cc/https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest",
+    f"{GITLAB_HOST}/api/v4/projects/{GITLAB_PROJECT_ID}/releases/permalink/latest",
 ]
 
-# ── 下载加速镜像前缀（用于替换 github.com 下载链接）──
+# ── 下载镜像前缀（内网直连，无需加速镜像）──
 _DOWNLOAD_MIRRORS = [
-    "",                                     # 空 = 使用原始链接
-    "https://gh-proxy.org/",                # gh-proxy.org 加速
-    "https://ghfast.top/",                  # ghfast 加速
-    "https://gh.llkk.cc/",                   # llkk 加速
-    "https://gh-proxy.com/",                # gh-proxy 加速
+    "",  # 直接使用原始链接
 ]
 
 # 重试配置
@@ -73,7 +58,7 @@ OLD_BACKUP_DIR_NAME = "_old_version_backup"
 # 更新锁文件（用于检测更新中途中断）
 _UPDATE_LOCK_FILE = "_update_in_progress.lock"
 
-# API 请求缓存（避免同一 IP 下多次请求触发 GitHub 限流）
+# API 请求缓存（避免短时间内重复请求工蜂 API）
 _CACHE_NO_UPDATE = "__no_update__"  # 哨兵值，表示已检查过且无更新
 _update_check_cache = {
     "result": None,
@@ -196,7 +181,6 @@ def _fetch_json_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | No
         result = subprocess.run(
             [_CURL_PATH, "-s", "--max-time", str(timeout),
              "-H", "User-Agent: PPEditor-Updater",
-             "-H", "Accept: application/vnd.github.v3+json",
              "-w", "\n__HTTP_CODE__%{http_code}",
              url],
             capture_output=True, timeout=timeout + 10,
@@ -418,7 +402,7 @@ def _fetch_json_via_urllib(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | 
     注意：在某些公司网络下 OpenSSL 3.0 可能因 SSL renegotiation 卡死。
     """
     headers = {
-        "Accept": "application/vnd.github.v3+json",
+        "Accept": "application/json",
         "User-Agent": "PPEditor-Updater",
     }
     # 尝试两种 SSL 策略：默认 → 跳过验证
@@ -502,9 +486,9 @@ def _compute_sha256(file_path: str) -> str:
 # ── 检查更新（带镜像 + 重试 + 缓存）─────────────────────────────
 def check_for_update(force: bool = False) -> dict | None:
     """
-    检查 GitHub 上是否有新版本。
+    检查工蜂上是否有新版本。
     
-    策略：依次尝试多个 API 镜像地址，全部失败后等待几秒重试，
+    策略：请求工蜂 GitLab API 获取最新 Release 信息，
     最多循环 _MAX_RETRIES 轮，尽最大努力获取版本信息。
     
     参数:
@@ -514,13 +498,13 @@ def check_for_update(force: bool = False) -> dict | None:
         有新版本时返回 dict:
             {
                 "version": "0.8.0",
-                "download_url": "https://github.com/.../xxx.zip",
+                "download_url": "https://git.woa.com/.../xxx.zip",
                 "changelog": "更新说明...",
                 "asset_name": "PPEditor_v0.8.0.zip"
             }
         无更新或检查失败时返回 None（静默失败，不影响正常使用）。
     """
-    # ── 缓存检查（防止短时间内重复请求 GitHub API 触发限流）──
+    # ── 缓存检查（防止短时间内重复请求工蜂 API）──
     now = time.time()
     if not force and _update_check_cache["result"] is not None:
         if now - _update_check_cache["timestamp"] < _update_check_cache["ttl"]:
@@ -548,9 +532,9 @@ def check_for_update(force: bool = False) -> dict | None:
 
     if data is None:
         # API 全部失败，不缓存为"无更新"，而是抛出异常让调用方区分
-        raise ConnectionError("所有 API 镜像均无法连接")
+        raise ConnectionError("无法连接工蜂服务器，请检查是否已连接公司网络")
 
-    # ── 解析版本信息 ──
+    # ── 解析版本信息（GitLab Release 格式）──
     try:
         latest_tag = data.get("tag_name", "")
         if not latest_tag:
@@ -566,12 +550,17 @@ def check_for_update(force: bool = False) -> dict | None:
             return None  # 已是最新版本
 
         # 在 Release Assets 中寻找 zip 文件
+        # GitLab 格式：data["assets"]["links"] 是附件列表
+        # 每个 link: {"name": "xxx.zip", "url": "...", "direct_asset_url": "..."}
         download_url = None
         asset_name = None
-        for asset in data.get("assets", []):
-            name = asset.get("name", "")
+        assets = data.get("assets", {})
+        links = assets.get("links", []) if isinstance(assets, dict) else []
+        for link in links:
+            name = link.get("name", "")
             if name.lower().endswith(ASSET_SUFFIX):
-                download_url = asset.get("browser_download_url", "")
+                # 优先使用 direct_asset_url，其次 url
+                download_url = link.get("direct_asset_url") or link.get("url", "")
                 asset_name = name
                 break
 
@@ -581,7 +570,7 @@ def check_for_update(force: bool = False) -> dict | None:
         result = {
             "version": latest_tag.lstrip("vV"),
             "download_url": download_url,
-            "changelog": data.get("body", "") or "暂无更新说明",
+            "changelog": data.get("description", "") or "暂无更新说明",
             "asset_name": asset_name,
         }
         # 缓存有新版本的结果
@@ -601,28 +590,20 @@ class UpdateCancelledError(Exception):
 
 def _build_mirror_urls(original_url: str) -> list[str]:
     """
-    根据原始 GitHub 下载链接，生成包含多个镜像的下载地址列表。
-    会根据镜像健康度动态排序，优先使用成功率高的镜像。
+    根据原始下载链接，生成下载地址列表。
+    工蜂内网直连，无需镜像加速，直接返回原始链接。
     """
-    urls = []
-    sorted_mirrors = _sort_mirrors_by_health(_DOWNLOAD_MIRRORS)
-    for prefix in sorted_mirrors:
-        if prefix:
-            urls.append(prefix + original_url)
-        else:
-            urls.append(original_url)
-    return urls
+    return [original_url]
 
 
 def download_update(download_url: str, progress_callback=None, stop_event=None) -> str:
     """
     下载 zip 文件到临时目录。
-    自动尝试多个镜像下载地址，任一成功即返回。
     优先使用 curl.exe 下载（兼容公司 SSL 代理环境）。
     下载完成后会验证 zip 文件完整性。
     
     参数:
-        download_url: zip 的下载链接（原始 GitHub 链接）
+        download_url: zip 的下载链接（工蜂 Release 链接）
         progress_callback: 可选，回调函数。
             - curl 下载时：callback(dict) 传递详细进度信息
               dict 包含 downloaded, speed, elapsed, percent, eta_str 等字段
