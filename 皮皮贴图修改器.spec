@@ -20,31 +20,55 @@
 
 import os
 import sys
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+# ── 确保 Pillow 完整打包（包含所有 C 扩展和子模块）──
+pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
 
 # ── 项目根目录 ──
 SPEC_DIR = os.path.dirname(os.path.abspath(SPECPATH))
 
+# ── 收集 app/ 目录下所有 .py 文件作为额外的分析入口 ──
+# 这样 PyInstaller 会自动分析它们的依赖（标准库 + 第三方库），
+# 确保打包后 _internal/ 中包含所有需要的模块。
+import glob
+app_dir = os.path.join(SPEC_DIR, 'app')
+app_scripts = glob.glob(os.path.join(app_dir, '*.py'))
+
 a = Analysis(
-    ['launcher.py'],
-    pathex=[SPEC_DIR],
-    binaries=[],
+    ['launcher.py'] + app_scripts,
+    pathex=[SPEC_DIR, app_dir],
+    binaries=pil_binaries,
     datas=[
         # 只打包图标文件到 exe 同级目录（供 launcher 和 Windows 任务栏使用）
         ('TextureToolGUI.ico', '.'),
         # 业务资源文件（bug.svg, json 等）已移至 app/ 目录，通过复制方式部署
-    ],
+    ] + pil_datas,
     hiddenimports=[
         # ── 第三方依赖（必须打包进 _internal/）──
         'cv2',                      # opencv-python（视频导入功能）
         'numpy',
-        'PIL',
+        'PIL',                      # Pillow 图像处理
+        'PIL.Image',
+        'PIL.ImageEnhance',
+        'PIL.ImageOps',
+        'PIL.ImageDraw',
+        'PIL.ImageFilter',
+        'PIL.ImageFont',
         'PySide6',
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
         'PySide6.QtSvg',           # SVG 渲染支持（image_viewer_tab 使用）
+        # ── 标准库模块（app/ 中使用但 launcher.py 未直接引用）──
+        'uuid',
+        'threading',
+        'json',
+        'hashlib',
+        'ssl',
+        'dataclasses',
         # ── 项目模块不再打包（它们在 app/ 目录下作为源码部署）──
         # 'Texture_tool_GUI_with_tabs', 'updater', 'version', ...
     ],
