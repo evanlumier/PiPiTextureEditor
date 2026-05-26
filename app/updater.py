@@ -6,6 +6,8 @@ updater.py —— GitHub Release 在线更新模块
 Release Asset 为 zip 压缩包。
 
 ★ 更新源：GitHub 公开仓库（无需任何认证）
+★ 版本检查：通过 raw.githubusercontent.com 读取远程 version.py（秒回，无 rate limit）
+★ 文件下载：通过 GitHub Release 直连下载（CDN 分发，稳定快速）
 ★ 发布提醒：上传 Release Asset 时请使用英文文件名（如 PPTextureEditor_vX.X.X.zip）
 """
 
@@ -17,6 +19,7 @@ import zipfile
 import subprocess
 import tempfile
 import time
+import re
 import ssl
 import hashlib
 import logging
@@ -30,29 +33,25 @@ _log = logging.getLogger("updater")
 
 # ====================================================================
 # ★ 配置区 —— GitHub Release 更新源配置 ★
-# ★ 上传 Release Asset 时请统一使用英文文件名，例如：
-# ★   PPTextureEditor_v0.8.0.zip
 # ====================================================================
 GITHUB_REPO = "evanlumier/PiPiTextureEditor"  # GitHub 仓库
 ASSET_SUFFIX = ".zip"                          # Release Asset 必须是 zip
 
-# ── API 地址（GitHub 公开仓库无需认证）──
-# 优先直连 GitHub API，失败后自动切换 gh-proxy 镜像兜底
-_API_URLS = [
-    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-    f"https://gh-proxy.org/https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-]
+# ── 版本检查地址（通过 raw.githubusercontent.com 读取 version.py）──
+# 该域名是 GitHub 官方 CDN，无 rate limit，国内网络通常可直连
+_VERSION_CHECK_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/app/version.py"
 
-# ── 下载镜像前缀（优先直连，失败后 gh-proxy 兜底）──
-_DOWNLOAD_MIRRORS = [
-    "",                          # 直接使用原始 GitHub 链接
-    "https://gh-proxy.org/",     # 国内代理镜像兜底
-]
+# ── Release 下载地址模板 ──
+# GitHub Release 下载链接会 302 重定向到 release-assets.githubusercontent.com CDN
+_RELEASE_DOWNLOAD_URL_TEMPLATE = f"https://github.com/{GITHUB_REPO}/releases/download/v{{version}}/PPTextureEditor_v{{version}}.zip"
+
+# ── Release 页面 changelog 地址（用于获取更新说明）──
+_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 # 重试配置
-_MAX_RETRIES = 2          # 整个镜像列表最多循环几轮
-_RETRY_DELAY = 2          # 每轮之间等待秒数
-_REQUEST_TIMEOUT = 15     # 单次请求超时秒数（公司 SSL 代理 renegotiation 较慢）
+_MAX_RETRIES = 2          # 最多重试几次
+_RETRY_DELAY = 2          # 重试之间等待秒数
+_REQUEST_TIMEOUT = 15     # 单次请求超时秒数
 
 # 旧版本备份文件夹名（更新时把旧文件移到这里，下次启动时清理）
 OLD_BACKUP_DIR_NAME = "_old_version_backup"
@@ -60,16 +59,13 @@ OLD_BACKUP_DIR_NAME = "_old_version_backup"
 # 更新锁文件（用于检测更新中途中断）
 _UPDATE_LOCK_FILE = "_update_in_progress.lock"
 
-# API 请求缓存（避免短时间内重复请求 GitHub API）
+# API 请求缓存（避免短时间内重复请求）
 _CACHE_NO_UPDATE = "__no_update__"  # 哨兵值，表示已检查过且无更新
 _update_check_cache = {
     "result": None,
     "timestamp": 0,
     "ttl": 600,  # 缓存有效期 10 分钟
 }
-
-# 镜像健康度追踪（记录每个镜像最近的成功/失败情况，用于动态排序）
-_mirror_health = {}  # key: 镜像前缀, value: {"success": int, "fail": int, "last_ok": float}
 
 
 # ── 版本比较工具 ──────────────────────────────────────────────────
@@ -141,50 +137,18 @@ def _find_curl() -> str | None:
 _CURL_PATH = _find_curl()
 
 
-# ── 内部：镜像健康度管理 ─────────────────────────────────────────
-def _record_mirror_result(prefix: str, success: bool):
-    """记录镜像请求结果，用于后续动态排序"""
-    if prefix not in _mirror_health:
-        _mirror_health[prefix] = {"success": 0, "fail": 0, "last_ok": 0}
-    if success:
-        _mirror_health[prefix]["success"] += 1
-        _mirror_health[prefix]["last_ok"] = time.time()
-    else:
-        _mirror_health[prefix]["fail"] += 1
-
-
-def _sort_mirrors_by_health(mirrors: list[str]) -> list[str]:
-    """根据镜像健康度动态排序，优先使用成功率高的镜像"""
-    def score(prefix):
-        h = _mirror_health.get(prefix)
-        if h is None:
-            return 0  # 未使用过的排中间
-        total = h["success"] + h["fail"]
-        if total == 0:
-            return 0
-        # 成功率 × 100 + 最近成功时间的新鲜度
-        rate = h["success"] / total * 100
-        recency = min(h["last_ok"] / 1e9, 1)  # 归一化
-        return rate + recency
-    return sorted(mirrors, key=score, reverse=True)
-
-
-
-# ── 内部：通过 curl.exe 请求（优先方案）────────────────────────────
-def _fetch_json_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | None:
+# ── 内部：通过 curl.exe 获取文本内容 ─────────────────────────────
+def _fetch_text_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> str | None:
     """
-    通过系统 curl.exe 请求 JSON 数据。
-    curl.exe 使用 Windows schannel SSL 引擎，能兼容公司 SSL 代理环境
-    （OpenSSL 3.0 对 SSL renegotiation 不兼容会卡死，而 schannel 支持）。
+    通过系统 curl.exe 请求文本内容。
+    curl.exe 使用 Windows schannel SSL 引擎，兼容公司 SSL 代理环境。
     """
     if not _CURL_PATH:
         return None
     try:
-        # -w 在输出末尾追加 HTTP 状态码，用于判断是否成功
         result = subprocess.run(
             [_CURL_PATH, "-s", "--max-time", str(timeout),
              "-H", "User-Agent: PPEditor-Updater",
-             "-H", "Accept: application/vnd.github.v3+json",
              "-w", "\n__HTTP_CODE__%{http_code}",
              url],
             capture_output=True, timeout=timeout + 10,
@@ -192,9 +156,9 @@ def _fetch_json_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | No
         )
         if result.returncode != 0:
             return None
-        
+
         raw = result.stdout.decode("utf-8", errors="replace")
-        
+
         # 从输出中分离 HTTP 状态码
         http_code = 0
         marker = "\n__HTTP_CODE__"
@@ -205,18 +169,27 @@ def _fetch_json_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | No
                 http_code = int(parts[1].strip())
             except ValueError:
                 pass
-        
+
         if http_code != 200:
-            if http_code == 403 and "rate limit" in raw.lower():
-                _log.warning("GitHub API 请求频率超限 (HTTP 403 Rate Limit): %s", url)
-            else:
-                _log.debug("curl %s 返回 HTTP %d", url, http_code)
+            _log.debug("curl %s 返回 HTTP %d", url, http_code)
             return None
-        
-        if raw.strip():
-            return json.loads(raw)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+
+        return raw.strip() if raw.strip() else None
+    except (subprocess.TimeoutExpired, Exception) as e:
         _log.debug("curl 请求 %s 失败: %s", url, e)
+    return None
+
+
+def _fetch_json_via_curl(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | None:
+    """
+    通过系统 curl.exe 请求 JSON 数据。
+    """
+    raw = _fetch_text_via_curl(url, timeout)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
     return None
 
 
@@ -262,12 +235,16 @@ def _get_content_length_via_curl(url: str, timeout: int = 15) -> int:
         if result.returncode != 0:
             return 0
         headers = result.stdout.decode("utf-8", errors="replace")
+        # 注意：curl -L 跟随重定向时会输出多个响应头块（302 + 200），
+        # 需要取最后一个 Content-Length（即最终 200 响应的真实文件大小）
+        content_length = 0
         for line in headers.splitlines():
             if line.lower().startswith("content-length:"):
                 try:
-                    return int(line.split(":", 1)[1].strip())
+                    content_length = int(line.split(":", 1)[1].strip())
                 except ValueError:
                     pass
+        return content_length
     except Exception as e:
         _log.debug("curl HEAD 请求 %s 失败: %s", url, e)
     return 0
@@ -279,10 +256,10 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
     """
     通过系统 curl.exe 下载文件。
     支持进度回调和取消。通过监控文件大小提供实时下载进度信息。
-    
+
     参数:
         total_size: 文件总大小（字节），如果提供则可计算百分比和剩余时间
-    
+
     progress_callback 接收 dict 参数：
         {
             "downloaded": int,        # 已下载字节数
@@ -301,7 +278,6 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
         return False
     try:
         # curl -L 跟随重定向，-o 输出文件
-        # 不使用 stdout=PIPE，避免潜在的缓冲区死锁风险
         cmd = [_CURL_PATH, "-L", "-s", "--max-time", str(timeout),
              "-H", "User-Agent: PPEditor-Updater",
              "-o", save_path, url]
@@ -316,14 +292,14 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
         last_speed_time = start_time
         last_speed_size = 0
         speed = 0.0
-        
+
         while proc.poll() is None:
             if stop_event and stop_event.is_set():
                 proc.kill()
                 return False
-            
+
             time.sleep(0.5)
-            
+
             # 获取当前已下载大小
             current_size = 0
             if os.path.isfile(save_path):
@@ -331,7 +307,7 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
                     current_size = os.path.getsize(save_path)
                 except OSError:
                     pass
-            
+
             # 计算下载速度（每2秒更新一次，避免抖动）
             now = time.time()
             elapsed = now - start_time
@@ -343,13 +319,13 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
             elif elapsed > 0 and speed == 0:
                 # 初始阶段用总平均速度
                 speed = current_size / elapsed
-            
+
             # 计算预计剩余时间
             eta_str = "计算中..."
             if speed > 0 and total_size > 0:
                 remaining = (total_size - current_size) / speed
                 eta_str = _format_time(remaining)
-            
+
             # 回调进度信息
             if progress_callback and current_size > last_size:
                 last_size = current_size
@@ -367,7 +343,7 @@ def _download_via_curl(url: str, save_path: str, timeout: int = 600,
                 if total_size > 0:
                     info["percent"] = int(current_size * 100 / total_size)
                 progress_callback(info)
-        
+
         if proc.returncode == 0 and os.path.isfile(save_path) and os.path.getsize(save_path) > 0:
             # 下载完成，发送最终进度
             final_size = os.path.getsize(save_path)
@@ -404,13 +380,12 @@ def _build_insecure_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def _fetch_json_via_urllib(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | None:
+def _fetch_text_via_urllib(url: str, timeout: int = _REQUEST_TIMEOUT) -> str | None:
     """
-    通过 Python urllib 请求 JSON 数据（fallback 方案）。
+    通过 Python urllib 请求文本内容（fallback 方案）。
     注意：在某些公司网络下 OpenSSL 3.0 可能因 SSL renegotiation 卡死。
     """
     headers = {
-        "Accept": "application/vnd.github.v3+json",
         "User-Agent": "PPEditor-Updater",
     }
     # 尝试两种 SSL 策略：默认 → 跳过验证
@@ -421,7 +396,7 @@ def _fetch_json_via_urllib(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | 
             if ssl_ctx:
                 kwargs["context"] = ssl_ctx
             with urlopen(req, **kwargs) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                return resp.read().decode("utf-8")
         except ssl.SSLCertVerificationError:
             continue
         except ssl.SSLError:
@@ -432,19 +407,159 @@ def _fetch_json_via_urllib(url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | 
     return None
 
 
-# ── 内部：统一的 API 请求（curl 优先 → urllib fallback）─────────────
-def _fetch_release_json(api_url: str, timeout: int = _REQUEST_TIMEOUT) -> dict | None:
+# ── 内部：从远程 version.py 内容中解析版本号 ─────────────────────
+def _parse_remote_version(content: str) -> str | None:
     """
-    向单个 API 地址请求最新 Release 信息。
-    优先使用 curl.exe（schannel SSL，兼容性最好），失败则 fallback 到 urllib。
+    从远程 version.py 文件内容中提取 __version__ 的值。
+    匹配格式：__version__ = "x.y.z"
     """
-    # 方案1：curl.exe（Windows schannel SSL）
-    data = _fetch_json_via_curl(api_url, timeout)
-    if data is not None:
-        return data
-    
-    # 方案2：Python urllib（OpenSSL）
-    return _fetch_json_via_urllib(api_url, timeout)
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', content)
+    if match:
+        return match.group(1)
+    return None
+
+
+# ── 内部：获取远程最新版本号 ─────────────────────────────────────
+def _fetch_remote_version() -> str | None:
+    """
+    从 raw.githubusercontent.com 读取远程 version.py，解析出最新版本号。
+    优先使用 curl.exe，失败则 fallback 到 urllib。
+    """
+    # 方案1：curl.exe（Windows schannel SSL，兼容性最好）
+    content = _fetch_text_via_curl(_VERSION_CHECK_URL)
+    if content:
+        ver = _parse_remote_version(content)
+        if ver:
+            return ver
+
+    # 方案2：Python urllib（OpenSSL，fallback）
+    content = _fetch_text_via_urllib(_VERSION_CHECK_URL)
+    if content:
+        ver = _parse_remote_version(content)
+        if ver:
+            return ver
+
+    return None
+
+
+# ── 内部：获取 Release changelog（可选，失败不影响更新）──────────
+def _fetch_changelog(version: str) -> str:
+    """
+    尝试从 GitHub API 获取 Release 的 changelog（body 字段）。
+    这是可选操作，失败时返回默认文本，不影响更新流程。
+    """
+    try:
+        # 尝试通过 curl 获取（可能因 rate limit 失败，无所谓）
+        data = _fetch_json_via_curl(_RELEASE_API_URL, timeout=10)
+        if data and isinstance(data, dict):
+            body = data.get("body", "")
+            if body:
+                return body
+    except Exception:
+        pass
+    return "暂无更新说明"
+
+
+# ── 检查更新 ─────────────────────────────────────────────────────
+def check_for_update(force: bool = False) -> dict | None:
+    """
+    检查 GitHub 上是否有新版本。
+
+    策略：通过 raw.githubusercontent.com 读取远程 version.py 获取最新版本号，
+    然后构造 Release 下载链接。简单、快速、无 rate limit。
+
+    参数:
+        force: 是否强制刷新（忽略缓存），用于手动检查更新
+
+    返回值:
+        有新版本时返回 dict:
+            {
+                "version": "0.8.6",
+                "download_url": "https://github.com/.../PPTextureEditor_v0.8.6.zip",
+                "changelog": "更新说明...",
+                "asset_name": "PPTextureEditor_v0.8.6.zip"
+            }
+        无更新或检查失败时返回 None（静默失败，不影响正常使用）。
+    """
+    # ── 缓存检查（防止短时间内重复请求）──
+    now = time.time()
+    if not force and _update_check_cache["result"] is not None:
+        if now - _update_check_cache["timestamp"] < _update_check_cache["ttl"]:
+            cached = _update_check_cache["result"]
+            _log.debug("使用缓存的更新检查结果（%d 秒前）",
+                       int(now - _update_check_cache["timestamp"]))
+            # 哨兵值表示"已检查过且无更新"，返回 None
+            return None if cached == _CACHE_NO_UPDATE else cached
+
+    # ── 获取远程最新版本号 ──
+    remote_version = None
+    last_error = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            remote_version = _fetch_remote_version()
+            if remote_version:
+                break
+        except Exception as e:
+            last_error = e
+        # 重试前等待
+        if attempt < _MAX_RETRIES - 1:
+            time.sleep(_RETRY_DELAY)
+
+    if not remote_version:
+        raise ConnectionError("无法连接更新服务器，请检查网络连接")
+
+    # ── 比较版本号 ──
+    latest_ver = _parse_version(remote_version)
+    current_ver = _parse_version(__version__)
+
+    if latest_ver <= current_ver:
+        # 缓存"已是最新"结果
+        _update_check_cache["result"] = _CACHE_NO_UPDATE
+        _update_check_cache["timestamp"] = now
+        return None  # 已是最新版本
+
+    # ── 构造下载链接 ──
+    version_str = remote_version.lstrip("vV")
+    download_url = _RELEASE_DOWNLOAD_URL_TEMPLATE.format(version=version_str)
+    asset_name = f"PPTextureEditor_v{version_str}.zip"
+
+    # ── 获取 changelog（可选，失败不影响）──
+    changelog = _fetch_changelog(version_str)
+
+    result = {
+        "version": version_str,
+        "download_url": download_url,
+        "changelog": changelog,
+        "asset_name": asset_name,
+    }
+    # 缓存有新版本的结果
+    _update_check_cache["result"] = result
+    _update_check_cache["timestamp"] = now
+    return result
+
+
+# ── 下载并应用更新 ────────────────────────────────────────────────
+class UpdateCancelledError(Exception):
+    """用户取消更新时抛出的异常"""
+    pass
+
+
+# 可信的下载域名白名单（防止下载链接指向恶意文件）
+_TRUSTED_DOWNLOAD_DOMAINS = [
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+]
+
+def _is_trusted_url(url: str) -> bool:
+    """检查下载链接是否来自可信域名"""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return any(host == d or host.endswith("." + d) for d in _TRUSTED_DOWNLOAD_DOMAINS)
+    except Exception:
+        return False
 
 
 # ── 下载文件完整性校验 ────────────────────────────────────────────
@@ -453,7 +568,7 @@ def _verify_zip_integrity(zip_path: str) -> bool:
     校验下载的 zip 文件完整性：
     1. 验证是有效的 zip 文件格式
     2. 尝试读取 zip 中的文件列表（检测损坏）
-    
+
     返回 True 表示文件完好，False 表示损坏。
     """
     try:
@@ -491,320 +606,139 @@ def _compute_sha256(file_path: str) -> str:
     return sha256.hexdigest()
 
 
-# ── 检查更新（带镜像 + 重试 + 缓存）─────────────────────────────
-def check_for_update(force: bool = False) -> dict | None:
-    """
-    检查 GitHub 上是否有新版本。
-    
-    策略：请求 GitHub API 获取最新 Release 信息，
-    最多循环 _MAX_RETRIES 轮，尽最大努力获取版本信息。
-    
-    参数:
-        force: 是否强制刷新（忽略缓存），用于手动检查更新
-    
-    返回值:
-        有新版本时返回 dict:
-            {
-                "version": "0.8.0",
-            "download_url": "https://github.com/.../xxx.zip",
-                "changelog": "更新说明...",
-                "asset_name": "PPEditor_v0.8.0.zip"
-            }
-        无更新或检查失败时返回 None（静默失败，不影响正常使用）。
-    """
-    # ── 缓存检查（防止短时间内重复请求 GitHub API）──
-    now = time.time()
-    if not force and _update_check_cache["result"] is not None:
-        if now - _update_check_cache["timestamp"] < _update_check_cache["ttl"]:
-            cached = _update_check_cache["result"]
-            _log.debug("使用缓存的更新检查结果（%d 秒前）",
-                       int(now - _update_check_cache["timestamp"]))
-            # 哨兵值表示"已检查过且无更新"，返回 None
-            return None if cached == _CACHE_NO_UPDATE else cached
-
-    data = None
-
-    # 多轮重试，每轮遍历所有镜像
-    for attempt in range(_MAX_RETRIES):
-        for api_url in _API_URLS:
-            data = _fetch_release_json(api_url)
-            if data is not None:
-                _log.debug("第 %d 轮，通过 %s 获取成功", attempt + 1, api_url)
-                break
-        if data is not None:
-            break
-        # 本轮所有镜像都失败了，等待后重试
-        if attempt < _MAX_RETRIES - 1:
-            _log.debug("第 %d 轮全部失败，%d 秒后重试...", attempt + 1, _RETRY_DELAY)
-            time.sleep(_RETRY_DELAY)
-
-    if data is None:
-        # API 全部失败，不缓存为"无更新"，而是抛出异常让调用方区分
-        raise ConnectionError("无法连接更新服务器，请检查网络连接（可能是 GitHub API 请求频率超限）")
-
-    # ── 解析版本信息（GitHub Release 格式）──
-    # /releases/latest 返回单个对象：
-    # {"tag_name": "v0.8.5", "body": "更新说明...", "assets": [{"name": "xxx.zip", "browser_download_url": "..."}]}
-    try:
-        # GitHub /releases/latest 返回单个对象
-        # 但如果使用了其他端点可能返回列表，兼容处理
-        if isinstance(data, list):
-            if not data:
-                return None
-            data.sort(key=lambda r: _parse_version(r.get("tag_name", "0")), reverse=True)
-            data = data[0]
-
-        latest_tag = data.get("tag_name", "")
-        if not latest_tag:
-            return None
-
-        latest_ver = _parse_version(latest_tag)
-        current_ver = _parse_version(__version__)
-
-        if latest_ver <= current_ver:
-            # 缓存"已是最新"结果
-            _update_check_cache["result"] = _CACHE_NO_UPDATE
-            _update_check_cache["timestamp"] = now
-            return None  # 已是最新版本
-
-        # 在 Release Assets 中寻找 zip 文件
-        # GitHub 格式：data["assets"] 是列表，每个元素有 "name" 和 "browser_download_url"
-        download_url = None
-        asset_name = None
-
-        assets = data.get("assets", [])
-        if isinstance(assets, list):
-            for asset in assets:
-                name = asset.get("name", "")
-                if name.lower().endswith(ASSET_SUFFIX):
-                    download_url = asset.get("browser_download_url", "")
-                    asset_name = name
-                    break
-
-        if not download_url:
-            _log.debug("Release 中未找到 zip 下载链接，原始数据: %s", json.dumps(data, ensure_ascii=False)[:500])
-            return None  # Release 中没有找到 zip 文件
-
-        result = {
-            "version": latest_tag.lstrip("vV"),
-            "download_url": download_url,
-            "changelog": data.get("body", "") or "暂无更新说明",
-            "asset_name": asset_name,
-        }
-        # 缓存有新版本的结果
-        _update_check_cache["result"] = result
-        _update_check_cache["timestamp"] = now
-        return result
-
-    except Exception as e:
-        _log.debug("解析 Release 信息失败: %s", e)
-        return None
-
-
-# ── 下载并应用更新 ────────────────────────────────────────────────
-class UpdateCancelledError(Exception):
-    """用户取消更新时抛出的异常"""
-    pass
-
-
-# 可信的下载域名白名单（防止镜像代理篡改下载链接指向恶意文件）
-_TRUSTED_DOWNLOAD_DOMAINS = [
-    "github.com",
-    "objects.githubusercontent.com",
-    "gh-proxy.org",
-]
-
-def _is_trusted_url(url: str) -> bool:
-    """检查下载链接是否来自可信域名"""
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
-        return any(host == d or host.endswith("." + d) for d in _TRUSTED_DOWNLOAD_DOMAINS)
-    except Exception:
-        return False
-
-def _build_mirror_urls(original_url: str) -> list[str]:
-    """
-    根据原始下载链接，生成多镜像下载地址列表。
-    固定顺序：直连优先，gh-proxy 兜底（不做健康度排序，确保直连永远第一）。
-    """
-    urls = []
-    for prefix in _DOWNLOAD_MIRRORS:
-        if prefix:
-            urls.append(prefix + original_url)
-        else:
-            urls.append(original_url)
-    return urls
-
-
 def download_update(download_url: str, progress_callback=None, stop_event=None) -> str:
     """
     下载 zip 文件到临时目录。
     优先使用 curl.exe 下载（兼容公司 SSL 代理环境）。
     下载完成后会验证 zip 文件完整性。
-    
+
     参数:
         download_url: zip 的下载链接（GitHub Release 链接）
-        progress_callback: 可选，回调函数。
-            - curl 下载时：callback(dict) 传递详细进度信息
-              dict 包含 downloaded, speed, elapsed, percent, eta_str 等字段
-            - urllib 下载时：callback(dict) 同样传递详细进度信息
+        progress_callback: 可选，回调函数 callback(dict) 传递详细进度信息
         stop_event: 可选，threading.Event 对象，set() 后中断下载
-    
+
     返回值:
         下载好的 zip 文件完整路径
-    
+
     异常:
-        所有镜像均下载失败时抛出异常，由调用方处理。
+        下载失败时抛出异常，由调用方处理。
         用户取消时抛出 UpdateCancelledError。
     """
+    # 安全校验：只信任白名单域名的下载链接
+    if not _is_trusted_url(download_url):
+        raise RuntimeError(f"不可信的下载链接: {download_url}")
+
     tmp_dir = tempfile.mkdtemp(prefix="ppeditor_update_")
     zip_path = os.path.join(tmp_dir, "update.zip")
 
-    mirror_urls = _build_mirror_urls(download_url)
-    last_error = None
+    # 检查是否被取消
+    if stop_event and stop_event.is_set():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise UpdateCancelledError("用户取消了下载")
 
-    for url in mirror_urls:
-        # 安全校验：只信任白名单域名的下载链接
-        if not _is_trusted_url(url):
-            _log.warning("跳过不可信的下载链接: %s", url)
-            continue
+    # 方案1：优先用 curl.exe 下载（跟随 302 重定向到 CDN）
+    # 先通过 HEAD 请求获取文件总大小，用于显示百分比进度
+    total_size = _get_content_length_via_curl(download_url, timeout=10)
+    _log.debug("文件总大小: %d bytes (%s)", total_size, _format_size(total_size))
 
-        # 确定当前使用的镜像前缀
-        current_prefix = ""
-        for prefix in _DOWNLOAD_MIRRORS:
-            if prefix and url.startswith(prefix):
-                current_prefix = prefix
-                break
-
-        # 检查是否被取消
-        if stop_event and stop_event.is_set():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise UpdateCancelledError("用户取消了下载")
-
-        # 方案1：优先用 curl.exe 下载
-        # 先通过 HEAD 请求获取文件总大小，用于显示百分比进度
-        total_size = _get_content_length_via_curl(url, timeout=10)
-        _log.debug("文件总大小: %d bytes (%s)", total_size, _format_size(total_size))
-
-        if _download_via_curl(url, zip_path, timeout=600,
-                              progress_callback=progress_callback,
-                              stop_event=stop_event,
-                              total_size=total_size):
-            # 验证下载文件完整性
-            if _verify_zip_integrity(zip_path):
-                _log.debug("curl 下载成功且 zip 完整: %s", url)
-                _record_mirror_result(current_prefix, True)
-                return zip_path
-            else:
-                _log.debug("curl 下载的 zip 文件损坏，尝试下一个镜像: %s", url)
-                _record_mirror_result(current_prefix, False)
-                if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                    except Exception:
-                        pass
-                continue
-
-        # 检查是否被取消（curl 下载失败可能是因为取消）
-        if stop_event and stop_event.is_set():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise UpdateCancelledError("用户取消了下载")
-
-        # 方案2：fallback 到 urllib
-        try:
-            _log.debug("curl 下载失败，尝试 urllib: %s", url)
-            dl_headers = {"User-Agent": "PPEditor-Updater"}
-            req = Request(url, headers=dl_headers)
-            ssl_ctx = _build_insecure_ssl_context()
-            with urlopen(req, timeout=300, context=ssl_ctx) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                start_time = time.time()
-                last_speed_time = start_time
-                last_speed_size = 0
-                speed = 0.0
-                with open(zip_path, "wb") as f:
-                    while True:
-                        if stop_event and stop_event.is_set():
-                            raise UpdateCancelledError("用户取消了下载")
-                        chunk = resp.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        now = time.time()
-                        elapsed = now - start_time
-                        speed_interval = now - last_speed_time
-                        if speed_interval >= 2.0:
-                            speed = (downloaded - last_speed_size) / speed_interval
-                            last_speed_time = now
-                            last_speed_size = downloaded
-                        elif elapsed > 0 and speed == 0:
-                            speed = downloaded / elapsed
-                        
-                        # 计算预计剩余时间
-                        eta_str = "计算中..."
-                        if speed > 0 and total > 0:
-                            remaining = (total - downloaded) / speed
-                            eta_str = _format_time(remaining)
-                        
-                        if progress_callback:
-                            info = {
-                                "downloaded": downloaded,
-                                "total": total,
-                                "speed": speed,
-                                "elapsed": elapsed,
-                                "downloaded_str": _format_size(downloaded),
-                                "total_str": _format_size(total) if total > 0 else "未知",
-                                "speed_str": _format_size(int(speed)) + "/s" if speed > 0 else "计算中...",
-                                "elapsed_str": _format_time(elapsed),
-                                "eta_str": eta_str,
-                            }
-                            if total > 0:
-                                info["percent"] = int(downloaded * 100 / total)
-                            progress_callback(info)
-
-            # 下载成功，验证文件完整性
-            if _verify_zip_integrity(zip_path):
-                _log.debug("urllib 下载成功且 zip 完整: %s (%d bytes)", url, os.path.getsize(zip_path))
-                _record_mirror_result(current_prefix, True)
-                return zip_path
-            else:
-                _log.debug("urllib 下载的 zip 文件损坏: %s", url)
-                _record_mirror_result(current_prefix, False)
-                if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                    except Exception:
-                        pass
-                continue
-
-        except UpdateCancelledError:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise
-        except Exception as e:
-            _log.debug("urllib 下载失败 %s: %s", url, e)
-            last_error = e
-            _record_mirror_result(current_prefix, False)
-            # 清理不完整的文件，继续尝试下一个镜像
+    if _download_via_curl(download_url, zip_path, timeout=600,
+                          progress_callback=progress_callback,
+                          stop_event=stop_event,
+                          total_size=total_size):
+        # 验证下载文件完整性
+        if _verify_zip_integrity(zip_path):
+            _log.debug("curl 下载成功且 zip 完整")
+            return zip_path
+        else:
+            _log.debug("curl 下载的 zip 文件损坏")
             if os.path.exists(zip_path):
                 try:
                     os.remove(zip_path)
                 except Exception:
                     pass
-            continue
 
-    # 所有镜像都失败了
+    # 检查是否被取消
+    if stop_event and stop_event.is_set():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise UpdateCancelledError("用户取消了下载")
+
+    # 方案2：fallback 到 urllib
+    try:
+        _log.debug("curl 下载失败，尝试 urllib: %s", download_url)
+        dl_headers = {"User-Agent": "PPEditor-Updater"}
+        req = Request(download_url, headers=dl_headers)
+        ssl_ctx = _build_insecure_ssl_context()
+        with urlopen(req, timeout=600, context=ssl_ctx) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            start_time = time.time()
+            last_speed_time = start_time
+            last_speed_size = 0
+            speed = 0.0
+            with open(zip_path, "wb") as f:
+                while True:
+                    if stop_event and stop_event.is_set():
+                        raise UpdateCancelledError("用户取消了下载")
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    elapsed = now - start_time
+                    speed_interval = now - last_speed_time
+                    if speed_interval >= 2.0:
+                        speed = (downloaded - last_speed_size) / speed_interval
+                        last_speed_time = now
+                        last_speed_size = downloaded
+                    elif elapsed > 0 and speed == 0:
+                        speed = downloaded / elapsed
+
+                    # 计算预计剩余时间
+                    eta_str = "计算中..."
+                    if speed > 0 and total > 0:
+                        remaining = (total - downloaded) / speed
+                        eta_str = _format_time(remaining)
+
+                    if progress_callback:
+                        info = {
+                            "downloaded": downloaded,
+                            "total": total,
+                            "speed": speed,
+                            "elapsed": elapsed,
+                            "downloaded_str": _format_size(downloaded),
+                            "total_str": _format_size(total) if total > 0 else "未知",
+                            "speed_str": _format_size(int(speed)) + "/s" if speed > 0 else "计算中...",
+                            "elapsed_str": _format_time(elapsed),
+                            "eta_str": eta_str,
+                        }
+                        if total > 0:
+                            info["percent"] = int(downloaded * 100 / total)
+                        progress_callback(info)
+
+        # 下载成功，验证文件完整性
+        if _verify_zip_integrity(zip_path):
+            _log.debug("urllib 下载成功且 zip 完整: %d bytes", os.path.getsize(zip_path))
+            return zip_path
+        else:
+            _log.debug("urllib 下载的 zip 文件损坏")
+
+    except UpdateCancelledError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        _log.debug("urllib 下载失败: %s", e)
+
+    # 全部失败
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    raise last_error or RuntimeError("所有下载镜像均失败")
+    raise RuntimeError("下载失败，请检查网络连接后重试")
 
 
 def apply_update(zip_path: str, progress_callback=None) -> bool:
     """
     解压 zip 并通过 bat 脚本延迟替换当前程序目录，然后重启。
-    
+
     更新策略（文件夹模式 - bat 脚本延迟替换）：
     1. 解压 zip 到临时目录
     2. 验证解压内容包含有效的 exe 文件
@@ -815,15 +749,11 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
        d. 启动新版本 exe
        e. 清理临时文件
     4. 启动 bat 脚本并退出当前进程
-    
-    这种方案解决了「exe 占用无法移动/覆盖」的问题，
-    因为 bat 脚本会等待当前进程完全退出后再操作文件。
-    
+
     参数:
         zip_path: 下载好的 zip 文件路径
         progress_callback: 可选，回调函数 callback(percent: int, stage: str)
-                          percent 范围 0-100，stage 为当前阶段描述
-    
+
     返回值:
         成功时返回 bat 脚本路径（由主线程启动）。
         失败时返回 False。
@@ -855,7 +785,6 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
                 _progress(pct, f"正在解压更新包... ({i+1}/{total_members})")
 
         # ── 智能检测 zip 内的根目录层级 ──
-        # 策略：从解压目录向下查找，直到找到包含 .exe 文件的层级
         _progress(36, "正在验证更新包...")
         source_dir = extract_dir
         entries = os.listdir(extract_dir)
@@ -864,7 +793,6 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         if len(entries) == 1:
             single = os.path.join(extract_dir, entries[0])
             if os.path.isdir(single):
-                # 检查这个子目录里是否有 exe 文件
                 has_exe = any(f.lower().endswith(".exe") for f in os.listdir(single)
                              if os.path.isfile(os.path.join(single, f)))
                 if has_exe:
@@ -915,22 +843,16 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
             _log.debug("写入锁文件失败: %s", e)
 
         # ④ 生成 bat 更新脚本
-        # bat 脚本会在当前进程退出后执行文件替换
         _progress(50, "正在生成更新脚本...")
 
         current_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), f"ppeditor_update_{current_pid}.bat")
 
         # ── 智能检测新版本包结构 ──
-        # 如果新版本包中包含 app/ 子目录，说明是拆包架构，只替换 app/
-        # 否则走全量替换（向后兼容老版本包结构）
         new_has_app_dir = os.path.isdir(os.path.join(source_dir, "app"))
         is_split_arch = new_has_app_dir or (code_dir != app_dir)
 
-        # 生成 bat 脚本内容
-        # 注意：bat 文件用 GBK 编码写入，cmd.exe 默认代码页就是 GBK(936)，
-        # 不要使用 chcp 65001 切换到 UTF-8，否则中文路径会乱码导致所有文件操作失败！
-
+        # 生成 bat 脚本内容（GBK 编码，cmd.exe 默认代码页）
         if is_split_arch and new_has_app_dir:
             # ── 拆包架构：只替换 app/ 目录 ──
             new_app_source = os.path.join(source_dir, "app")
@@ -1059,7 +981,7 @@ for /d %%f in ("{app_dir}\\*") do (
 echo 备份完成。
 echo.
 
-:: 兜底清理：确保旧 _internal 目录被彻底删除（防止 move 失败导致残留）
+:: 兜底清理：确保旧 _internal 目录被彻底删除
 if exist "{app_dir}\\_internal" rmdir /s /q "{app_dir}\\_internal" >nul 2>&1
 
 :: 复制新文件
@@ -1131,7 +1053,7 @@ exit /b 1
                 os.remove(lock_file)
         except Exception:
             pass
-        # 失败时清理解压临时目录（成功时由 bat 脚本自行清理）
+        # 失败时清理解压临时目录
         try:
             if extract_dir and os.path.isdir(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
@@ -1140,7 +1062,7 @@ exit /b 1
         return False
 
     finally:
-        # 清理下载的 zip 临时目录（无论成功失败都清理，bat 脚本不需要 zip）
+        # 清理下载的 zip 临时目录
         try:
             zip_parent = os.path.dirname(zip_path)
             if zip_parent.startswith(tempfile.gettempdir()):
@@ -1154,7 +1076,7 @@ def recover_interrupted_update() -> bool:
     """
     检测上次更新是否中途中断（通过锁文件判断）。
     如果检测到中断，尝试从备份中恢复旧版本。
-    
+
     应在每次启动时尽早调用（在 cleanup_old_version 之前）。
     返回 True 表示检测到中断并已尝试恢复。
     """
@@ -1169,18 +1091,13 @@ def recover_interrupted_update() -> bool:
     _log.warning("检测到更新锁文件，上次更新可能中途中断")
 
     try:
-        # 读取锁文件信息
         with open(lock_file, "r", encoding="utf-8") as f:
             lock_info = json.load(f)
         _log.warning("中断的更新信息: %s", lock_info)
     except Exception:
         lock_info = {}
 
-    # 尝试从备份中恢复（覆盖可能损坏的文件）
-    # 注意：拆包架构下，增量更新备份的是 app/ 子目录的内容，
-    # 恢复时应恢复到 code_dir（app/ 子目录），而非 app_dir（根目录）。
-    # 通过检查备份内容来判断：如果备份中包含 .py 文件但不包含 .exe，
-    # 说明是增量备份，恢复到 code_dir；否则恢复到 app_dir（全量模式）。
+    # 尝试从备份中恢复
     if os.path.exists(backup_dir) and os.listdir(backup_dir):
         _log.warning("发现备份目录，尝试恢复旧版本...")
 
@@ -1188,7 +1105,6 @@ def recover_interrupted_update() -> bool:
         backup_items = os.listdir(backup_dir)
         has_exe = any(f.lower().endswith(".exe") for f in backup_items)
         has_py = any(f.lower().endswith(".py") for f in backup_items)
-        # 如果备份中有 .py 但没有 .exe，说明是增量备份，恢复到 code_dir
         restore_target = code_dir if (has_py and not has_exe) else app_dir
         _log.warning("恢复目标目录: %s（增量=%s）", restore_target, has_py and not has_exe)
 
@@ -1196,7 +1112,6 @@ def recover_interrupted_update() -> bool:
             for item in os.listdir(backup_dir):
                 src = os.path.join(backup_dir, item)
                 dst = os.path.join(restore_target, item)
-                # 先删除目标（可能是更新中途写入的不完整文件）
                 try:
                     if os.path.isdir(dst):
                         shutil.rmtree(dst, ignore_errors=True)
@@ -1204,7 +1119,6 @@ def recover_interrupted_update() -> bool:
                         os.remove(dst)
                 except Exception:
                     pass
-                # 从备份恢复
                 if os.path.isdir(src):
                     shutil.copytree(src, dst)
                 else:
