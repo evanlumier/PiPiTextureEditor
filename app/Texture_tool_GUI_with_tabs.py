@@ -499,7 +499,6 @@ class MainWindow(ExportDirMixin, QMainWindow):
         )
         self.btn_export_ue4.clicked.connect(self.export_to_ue4)
         ue4_bar_layout.addWidget(self.btn_export_ue4)
-        self._ue4_bar = ue4_bar  # 保存引用，供 bug 按钮定位使用
 
         # 将 tabs + UE4 联动区域组合为中央容器
         central = QWidget()
@@ -509,6 +508,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
         central_layout.addWidget(tabs, 1)
         central_layout.addWidget(ue4_bar, 0)
         self.setCentralWidget(central)
+        self._ue4_bar = ue4_bar  # 保存引用
 
         # ── 左下角 bug 按钮（覆盖在主窗口上，绝对定位） ──
         self._bug_btn = QPushButton(self)
@@ -545,6 +545,46 @@ class MainWindow(ExportDirMixin, QMainWindow):
             }
         """)
         self._bug_btn.raise_()  # 确保在最上层
+
+        # ── UE4 联动栏折叠按钮（绝对定位，在 bug 按钮下方） ──
+        self._ue4_toggle_btn = QPushButton(self)
+        self._ue4_toggle_btn.setFixedSize(32, 32)
+        self._ue4_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self._ue4_toggle_btn.setToolTip("展开 UE4 联动栏")
+        self._ue4_toggle_btn.clicked.connect(self._toggle_ue4_bar)
+
+        _ue4_svg_name = "ue4_toggle.svg"
+        _ue4_svg_candidates = []
+        _ue4_svg_candidates.append(os.path.join(_this_dir, _ue4_svg_name))
+        if getattr(sys, 'frozen', False):
+            _ue4_svg_candidates.append(os.path.join(os.path.dirname(sys.executable), _ue4_svg_name))
+            _ue4_svg_candidates.append(os.path.join(getattr(sys, '_MEIPASS', ''), _ue4_svg_name))
+        _ue4_svg_path = next((p for p in _ue4_svg_candidates if os.path.exists(p)), None)
+        if _ue4_svg_path:
+            self._ue4_toggle_btn.setIcon(QIcon(_ue4_svg_path))
+            self._ue4_toggle_btn.setIconSize(QSize(22, 22))
+
+        self._ue4_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QPushButton:hover {
+                background-color: #313244;
+                border-color: #45475a;
+            }
+            QPushButton:pressed {
+                background-color: #45475a;
+            }
+        """)
+        self._ue4_toggle_btn.raise_()
+
+        # 启动时根据记忆状态决定 UE4 联动栏是否显示（默认折叠）
+        _ue4_bar_visible = self._load_ue4_bar_collapsed_state()
+        ue4_bar.setVisible(_ue4_bar_visible)
+        self._update_ue4_toggle_tooltip(_ue4_bar_visible)
 
         # Tab 1: 贴图修改（原有功能）
         root = QWidget()
@@ -2022,6 +2062,56 @@ class MainWindow(ExportDirMixin, QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败：\n{e}")
 
+    # ---------------- UE4 联动栏折叠/展开 ----------------
+    def _toggle_ue4_bar(self):
+        """切换 UE4 联动栏的显示/隐藏状态"""
+        visible = not self._ue4_bar.isVisible()
+
+        # 锁定窗口大小，防止 setVisible 触发布局系统撑大/缩小窗口
+        current_h = self.height()
+        self.setFixedHeight(current_h)
+
+        self._ue4_bar.setVisible(visible)
+
+        # 解除固定高度限制，允许用户后续自由调整窗口大小
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+
+        self._update_ue4_toggle_tooltip(visible)
+        self._save_ue4_bar_collapsed_state(visible)
+        # 重新定位按钮（因为 ue4_bar 高度变化）
+        self._reposition_bug_btn()
+
+    def _update_ue4_toggle_tooltip(self, bar_visible: bool):
+        """根据当前状态更新折叠按钮的 tooltip"""
+        if bar_visible:
+            self._ue4_toggle_btn.setToolTip("收起 UE4 联动栏")
+        else:
+            self._ue4_toggle_btn.setToolTip("展开 UE4 联动栏")
+
+    def _load_ue4_bar_collapsed_state(self) -> bool:
+        """加载 UE4 联动栏的显示状态，返回 True 表示可见，False 表示折叠。默认折叠。"""
+        try:
+            appdata = os.getenv("APPDATA") or ""
+            folder = os.path.join(appdata, "GUITextureEditor")
+            filepath = os.path.join(folder, "ue4_bar_visible.txt")
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read().strip() == "1"
+        except Exception:
+            return False  # 默认折叠
+
+    def _save_ue4_bar_collapsed_state(self, visible: bool):
+        """保存 UE4 联动栏的显示状态"""
+        try:
+            appdata = os.getenv("APPDATA") or ""
+            folder = os.path.join(appdata, "GUITextureEditor")
+            os.makedirs(folder, exist_ok=True)
+            filepath = os.path.join(folder, "ue4_bar_visible.txt")
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("1" if visible else "0")
+        except Exception:
+            pass
+
     # ---------------- UE4 联动 ----------------
     def _get_ue4_target_path_cache(self, tab_idx: int = 0) -> str:
         """UE4 目标路径缓存文件路径（按 Tab 索引独立存储）"""
@@ -2271,18 +2361,30 @@ class MainWindow(ExportDirMixin, QMainWindow):
                 pass
 
     def _reposition_bug_btn(self):
-        """将 bug 按钮固定在窗口左下角（tab bar 列的底部，UE4 联动栏上方）"""
+        """将 bug 按钮和 UE4 折叠按钮固定在窗口左下角（从底部向上排列）"""
         if not hasattr(self, '_bug_btn'):
             return
         tab_bar = self._tabs.tabBar()
         bar_pos = tab_bar.mapTo(self, QPoint(0, 0))
-        btn = self._bug_btn
-        # 计算 UE4 联动栏高度，确保 bug 按钮始终在其上方
-        ue4_bar_h = self._ue4_bar.height() if hasattr(self, '_ue4_bar') else 0
-        x = bar_pos.x() + (tab_bar.width() - btn.width()) // 2
-        y = self.height() - btn.height() - 10 - ue4_bar_h
-        btn.move(x, y)
-        btn.raise_()
+        # 计算 UE4 联动栏高度
+        ue4_bar_h = self._ue4_bar.height() if (hasattr(self, '_ue4_bar') and self._ue4_bar.isVisible()) else 0
+        # 水平居中于 tab bar 列
+        x = bar_pos.x() + (tab_bar.width() - self._bug_btn.width()) // 2
+
+        # 从底部向上排列：UE4 折叠按钮在最底部，bug 按钮在其上方
+        bottom_margin = 10
+        if hasattr(self, '_ue4_toggle_btn'):
+            toggle_btn = self._ue4_toggle_btn
+            toggle_y = self.height() - toggle_btn.height() - bottom_margin - ue4_bar_h
+            toggle_btn.move(x, toggle_y)
+            toggle_btn.raise_()
+            # bug 按钮在折叠按钮上方
+            bug_y = toggle_y - self._bug_btn.height() - 4
+        else:
+            bug_y = self.height() - self._bug_btn.height() - bottom_margin - ue4_bar_h
+
+        self._bug_btn.move(x, bug_y)
+        self._bug_btn.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -27,6 +27,9 @@ block_cipher = None
 # ── 确保 Pillow 完整打包（包含所有 C 扩展和子模块）──
 pil_datas, pil_binaries, pil_hiddenimports = collect_all('PIL')
 
+# ── 确保 OpenCV 完整打包（包含 FFmpeg DLL，解码 MOV/MP4 等视频格式必需）──
+cv2_datas, cv2_binaries, cv2_hiddenimports = collect_all('cv2')
+
 # ── 项目根目录 ──
 SPEC_DIR = os.path.dirname(os.path.abspath(SPECPATH))
 
@@ -40,12 +43,12 @@ app_scripts = glob.glob(os.path.join(app_dir, '*.py'))
 a = Analysis(
     ['launcher.py'] + app_scripts,
     pathex=[SPEC_DIR, app_dir],
-    binaries=pil_binaries,
+    binaries=pil_binaries + cv2_binaries,
     datas=[
         # 只打包图标文件到 exe 同级目录（供 launcher 和 Windows 任务栏使用）
         ('TextureToolGUI.ico', '.'),
         # 业务资源文件（bug.svg, json 等）已移至 app/ 目录，通过复制方式部署
-    ] + pil_datas,
+    ] + pil_datas + cv2_datas,
     hiddenimports=[
         # ── 第三方依赖（必须打包进 _internal/）──
         'cv2',                      # opencv-python（视频导入功能）
@@ -62,6 +65,9 @@ a = Analysis(
         'PySide6.QtGui',
         'PySide6.QtWidgets',
         'PySide6.QtSvg',           # SVG 渲染支持（image_viewer_tab 使用）
+        'fitz',                     # PyMuPDF（PDF 查看支持）
+        'pymupdf',                  # PyMuPDF 底层模块
+        'psd_tools',                # psd-tools（PSD/PSB 查看支持）
         # ── 标准库模块（app/ 中使用但 launcher.py 未直接引用）──
         'uuid',
         'threading',
