@@ -14,7 +14,7 @@ from typing import Optional
 
 from PIL import Image
 
-from PySide6.QtCore import Qt, QRect, QPoint
+from PySide6.QtCore import Qt, QRect, QPoint, QTimer
 from PySide6.QtGui import (
     QPixmap,
     QPainter,
@@ -534,6 +534,13 @@ class CropDialog(QDialog):
 
         self._rotate_slider.valueChanged.connect(self._on_rotate_slider_changed)
 
+        # 防抖定时器（避免拖动滑块时频繁旋转大图导致卡顿）
+        self._rotate_debounce = QTimer(self)
+        self._rotate_debounce.setSingleShot(True)
+        self._rotate_debounce.setInterval(50)  # 50ms 防抖
+        self._rotate_debounce.timeout.connect(self._apply_rotation)
+        self._pending_angle: float = 0.0
+
         # ---- 布局 ----
         layout = QVBoxLayout(self)
         layout.addWidget(tips)
@@ -544,10 +551,15 @@ class CropDialog(QDialog):
         self.result_img: Optional[Image.Image] = None
 
     def _on_rotate_slider_changed(self, value: int):
-        """滑块值变化时旋转画布"""
+        """滑块值变化时旋转画布（带防抖）"""
         angle = value / 10.0
         self._rotate_value_label.setText(f"{angle:.1f}°")
-        self.canvas.rotate_to_angle(angle)
+        self._pending_angle = angle
+        self._rotate_debounce.start()
+
+    def _apply_rotation(self):
+        """防抖结束后实际执行旋转"""
+        self.canvas.rotate_to_angle(self._pending_angle)
 
     def _reset_rotation(self):
         """归零旋转"""
