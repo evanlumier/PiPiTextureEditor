@@ -2379,6 +2379,18 @@ class ImageViewerTab(QWidget):
     def _get_current_pil_image(self) -> Optional[Image.Image]:
         """获取当前预览的 PIL Image"""
         pil_img = self._pil_image
+
+        # 如果是 GIF 动画（多帧），优先从 QMovie 获取当前帧
+        # 因为 _pil_image 是 GIF 文件对象，convert("RGBA") 只会取第一帧
+        if pil_img is not None and self._viewer._movie is not None:
+            pm = self._viewer.current_pixmap()
+            if pm is not None and not pm.isNull():
+                qimg = pm.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+                w, h = qimg.width(), qimg.height()
+                ptr = qimg.bits()
+                arr = bytes(ptr)
+                return Image.frombytes("RGBA", (w, h), arr, "raw", "RGBA")
+
         if pil_img is None:
             pm = self._viewer.current_pixmap()
             if pm is None or pm.isNull():
