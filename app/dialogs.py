@@ -59,8 +59,10 @@ class CropCanvas(QLabel):
         self.setStyleSheet("background:#2a2a38;border-radius:10px;")
         self.setMouseTracking(True)
 
-        self.pil_img = pil_img.convert("RGBA")
+        self._original_img = pil_img.convert("RGBA")  # 保留原图用于重新旋转
+        self.pil_img = self._original_img.copy()
         self.img_w, self.img_h = self.pil_img.size
+        self._rotation_angle: float = 0.0  # 当前旋转角度
 
         self._pixmap_scaled: Optional[QPixmap] = None
         self._pix_rect: Optional[QRect] = None  # scaled pixmap 在 label 内的实际区域
@@ -280,7 +282,23 @@ class CropCanvas(QLabel):
     def rotate_image(self, clockwise: bool = True):
         """旋转图片90度，clockwise=True顺时针，False逆时针。"""
         angle = -90 if clockwise else 90
-        self.pil_img = self.pil_img.rotate(angle, expand=True)
+        self._rotation_angle = (self._rotation_angle + (-angle)) % 360
+        if self._rotation_angle > 180:
+            self._rotation_angle -= 360
+        self.pil_img = self._original_img.rotate(-self._rotation_angle, expand=True, resample=Image.BICUBIC)
+        self.img_w, self.img_h = self.pil_img.size
+        # 清除裁切选区
+        self.sel_rect = None
+        self._render()
+
+    def rotate_to_angle(self, angle: float):
+        """旋转图片到指定角度（基于原图重新旋转）。"""
+        self._rotation_angle = angle
+        if angle == 0:
+            self.pil_img = self._original_img.copy()
+        else:
+            # PIL rotate 正值为逆时针，所以取负
+            self.pil_img = self._original_img.rotate(-angle, expand=True, resample=Image.BICUBIC)
         self.img_w, self.img_h = self.pil_img.size
         # 清除裁切选区
         self.sel_rect = None
@@ -437,10 +455,18 @@ class CropDialog(QDialog):
             }
             QPushButton:hover { background-color: #45475a; border-color: #89b4fa; }
             QPushButton:pressed { background-color: #89b4fa; color: #1e1e2e; }
+            QSlider::groove:horizontal {
+                height: 6px; background: #313244; border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #89b4fa; width: 14px; height: 14px;
+                margin: -4px 0; border-radius: 7px;
+            }
+            QSlider::sub-page:horizontal { background: #89b4fa; border-radius: 3px; }
         """)
 
         self.canvas = CropCanvas(pil_img)
-        self.canvas.setMinimumSize(810, 560)
+        self.canvas.setMinimumSize(860, 560)
 
         tips = QLabel("拖拽创建裁切框；框内拖动移动；拖动角点缩放；确定后应用。")
         tips.setWordWrap(True)
@@ -449,52 +475,94 @@ class CropDialog(QDialog):
         btns.accepted.connect(self._on_ok)
         btns.rejected.connect(self.reject)
 
-        # ---- 左侧工具栏 ----
-        toolbar = QWidget()
-        toolbar.setFixedWidth(42)
-        toolbar.setStyleSheet("background: #252536; border-radius: 8px;")
-        tb_layout = QVBoxLayout(toolbar)
-        tb_layout.setContentsMargins(4, 8, 4, 8)
-        tb_layout.setSpacing(6)
+        # ---- 顶部旋转滑块 ----
+        rotate_row = QHBoxLayout()
+        rotate_row.setSpacing(8)
 
-        btn_ccw = QPushButton("↺")
-        btn_ccw.setToolTip("逆时针旋转 90°")
-        btn_ccw.setFixedSize(34, 34)
-        btn_ccw.setStyleSheet("""
-            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
+        rotate_label = QLabel("旋转：")
+        rotate_label.setFixedWidth(40)
+
+        self._rotate_slider = QSlider(Qt.Horizontal)
+        self._rotate_slider.setRange(-1800, 1800)  # 0.1° 精度
+        self._rotate_slider.setValue(0)
+        self._rotate_slider.setSingleStep(1)
+        self._rotate_slider.setPageStep(150)  # 15°
+
+        self._rotate_value_label = QLabel("0°")
+        self._rotate_value_label.setFixedWidth(48)
+        self._rotate_value_label.setAlignment(Qt.AlignCenter)
+        self._rotate_value_label.setStyleSheet("color: #89b4fa; font-size: 13px; font-weight: bold;")
+
+        btn_reset_rotate = QPushButton("归零")
+        btn_reset_rotate.setFixedSize(48, 28)
+        btn_reset_rotate.setStyleSheet("""
+            QPushButton { font-size: 11px; padding: 2px 6px; border-radius: 5px;
                           background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
             QPushButton:hover { background: #45475a; border-color: #89b4fa; }
             QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
         """)
-        btn_ccw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=False))
+        btn_reset_rotate.clicked.connect(self._reset_rotation)
 
-        btn_cw = QPushButton("↻")
-        btn_cw.setToolTip("顺时针旋转 90°")
-        btn_cw.setFixedSize(34, 34)
-        btn_cw.setStyleSheet("""
-            QPushButton { font-size: 18px; padding: 0; border-radius: 6px;
+        btn_ccw90 = QPushButton("↺")
+        btn_ccw90.setToolTip("逆时针 90°")
+        btn_ccw90.setFixedSize(28, 28)
+        btn_ccw90.setStyleSheet("""
+            QPushButton { font-size: 16px; padding: 0; border-radius: 5px;
                           background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
             QPushButton:hover { background: #45475a; border-color: #89b4fa; }
             QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
         """)
-        btn_cw.clicked.connect(lambda: self.canvas.rotate_image(clockwise=True))
+        btn_ccw90.clicked.connect(lambda: self._rotate_step(-90))
 
-        tb_layout.addWidget(btn_ccw)
-        tb_layout.addWidget(btn_cw)
-        tb_layout.addStretch()
+        btn_cw90 = QPushButton("↻")
+        btn_cw90.setToolTip("顺时针 90°")
+        btn_cw90.setFixedSize(28, 28)
+        btn_cw90.setStyleSheet("""
+            QPushButton { font-size: 16px; padding: 0; border-radius: 5px;
+                          background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
+            QPushButton:hover { background: #45475a; border-color: #89b4fa; }
+            QPushButton:pressed { background: #89b4fa; color: #1e1e2e; }
+        """)
+        btn_cw90.clicked.connect(lambda: self._rotate_step(90))
 
-        # ---- 中间区域（工具栏 + 画布）水平排列 ----
-        center_layout = QHBoxLayout()
-        center_layout.setSpacing(6)
-        center_layout.addWidget(toolbar)
-        center_layout.addWidget(self.canvas, 1)
+        rotate_row.addWidget(rotate_label)
+        rotate_row.addWidget(btn_ccw90)
+        rotate_row.addWidget(self._rotate_slider, 1)
+        rotate_row.addWidget(btn_cw90)
+        rotate_row.addWidget(self._rotate_value_label)
+        rotate_row.addWidget(btn_reset_rotate)
 
+        self._rotate_slider.valueChanged.connect(self._on_rotate_slider_changed)
+
+        # ---- 布局 ----
         layout = QVBoxLayout(self)
         layout.addWidget(tips)
-        layout.addLayout(center_layout, 1)
+        layout.addLayout(rotate_row)
+        layout.addWidget(self.canvas, 1)
         layout.addWidget(btns)
 
         self.result_img: Optional[Image.Image] = None
+
+    def _on_rotate_slider_changed(self, value: int):
+        """滑块值变化时旋转画布"""
+        angle = value / 10.0
+        self._rotate_value_label.setText(f"{angle:.1f}°")
+        self.canvas.rotate_to_angle(angle)
+
+    def _reset_rotation(self):
+        """归零旋转"""
+        self._rotate_slider.setValue(0)
+
+    def _rotate_step(self, degrees: int):
+        """步进旋转（±90°）"""
+        current = self._rotate_slider.value() / 10.0
+        new_angle = current + degrees
+        # 限制在 -180 ~ 180 范围内
+        if new_angle > 180:
+            new_angle -= 360
+        elif new_angle < -180:
+            new_angle += 360
+        self._rotate_slider.setValue(int(new_angle * 10))
 
     def _on_ok(self):
         cropped = self.canvas.get_cropped_image()
