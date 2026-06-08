@@ -9,7 +9,7 @@ widgets.py - 通用 UI 控件
 """
 
 import os
-from typing import Optional
+from typing import Optional, Callable
 
 from PySide6.QtCore import Qt, QRectF, QPointF, QSize
 from PySide6.QtGui import (
@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QStyleOptionTab,
     QStyle,
 )
+
+from tab_transfer import RIGHT_CLICK_THRESHOLD
 
 # ========= 兼容：不同 PySide6 版本 QStylePainter 所在模块不同 =========
 try:
@@ -118,9 +120,11 @@ class CheckerLabel(QWidget):
         self._offset = QPointF(0, 0)   # 图片左上角在控件中的偏移
         self._fit_done: bool = False    # 是否已执行过自适应
 
-        # ── 右键拖拽 ──
+        # ── 右键拖拽 & 单击区分 ──
         self._dragging: bool = False
         self._last_mouse = QPointF()
+        self._right_press_pos: Optional[QPointF] = None  # 右键按下位置
+        self._right_click_callback: Optional[Callable] = None  # 右键单击回调
 
     # ── 兼容 QLabel 接口 ──────────────────────────────────────────────
     def setPixmap(self, pix: QPixmap):
@@ -206,11 +210,11 @@ class CheckerLabel(QWidget):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        # 右键拖拽平移
+        # 右键：记录按下位置，延迟判断是单击还是拖拽
         if event.button() == Qt.RightButton and self._source_pix is not None:
-            self._dragging = True
+            self._right_press_pos = event.position()
+            self._dragging = False
             self._last_mouse = event.position()
-            self.setCursor(Qt.ClosedHandCursor)
             return
         # 左键点击导入（仅在没有图片时）
         if event.button() == Qt.LeftButton and self._on_drop_callback is not None:
@@ -225,7 +229,17 @@ class CheckerLabel(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._dragging:
+        # 右键移动：检查是否超过阈值进入拖拽
+        if self._right_press_pos is not None and (event.buttons() & Qt.RightButton):
+            if not self._dragging:
+                delta = event.position() - self._right_press_pos
+                dist = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                if dist >= RIGHT_CLICK_THRESHOLD:
+                    self._dragging = True
+                    self.setCursor(Qt.ClosedHandCursor)
+                    self._last_mouse = event.position()
+                return  # 阈值内不做任何事
+            # 已进入拖拽模式，执行平移
             delta = event.position() - self._last_mouse
             self._offset = QPointF(self._offset.x() + delta.x(),
                                    self._offset.y() + delta.y())
@@ -236,9 +250,15 @@ class CheckerLabel(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.RightButton and self._dragging:
+        if event.button() == Qt.RightButton:
+            was_dragging = self._dragging
             self._dragging = False
+            self._right_press_pos = None
             self.setCursor(Qt.ArrowCursor)
+            if not was_dragging:
+                # 右键单击（未拖拽）→ 弹出发送菜单
+                if self._right_click_callback is not None:
+                    self._right_click_callback(event.globalPosition().toPoint())
             return
         super().mouseReleaseEvent(event)
 

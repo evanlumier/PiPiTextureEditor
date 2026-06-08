@@ -36,6 +36,11 @@ from PySide6.QtWidgets import (
 # =========================================================================
 #  常量
 # =========================================================================
+
+from tab_transfer import (
+    TAB_VIEWER, build_send_menu, pil_to_temp_png, RIGHT_CLICK_THRESHOLD,
+)
+
 # Pillow 原生支持的格式
 PILLOW_EXTS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".ico",
@@ -367,6 +372,8 @@ class _CheckerWidget(QWidget):
         self._offset = QPointF(0, 0)
         self._dragging = False
         self._last_mouse = QPointF()
+        self._right_press_pos: Optional[QPointF] = None  # 右键按下位置（5px阈值）
+        self._right_click_callback = None  # 右键单击回调
         self._cell = 12  # 棋盘格子大小
         self.setMinimumSize(200, 200)
         self.setMouseTracking(True)
@@ -663,13 +670,34 @@ class _CheckerWidget(QWidget):
                 # 触发吸取成功动效
                 self._start_pick_animation(event.position(), color)
             return
-        # 右键 或 中键 拖拽平移
-        if event.button() == Qt.MouseButton.RightButton or event.button() == Qt.MouseButton.MiddleButton:
+        # 右键 或 中键 拖拽平移（右键带 5px 阈值）
+        if event.button() == Qt.MouseButton.MiddleButton:
             self._dragging = True
             self._last_mouse = event.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._right_press_pos = event.position()
+            self._dragging = False
+            self._last_mouse = event.position()
 
     def mouseMoveEvent(self, event: QMouseEvent):
+        # 右键移动：检查是否超过阈值进入拖拽
+        if self._right_press_pos is not None and (event.buttons() & Qt.MouseButton.RightButton):
+            if not self._dragging:
+                delta = event.position() - self._right_press_pos
+                dist = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                if dist >= RIGHT_CLICK_THRESHOLD:
+                    self._dragging = True
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                    self._last_mouse = event.position()
+                return  # 阈值内不做任何事
+            # 已进入拖拽模式
+            delta = event.position() - self._last_mouse
+            self._offset += delta
+            self._last_mouse = event.position()
+            self.update()
+            self.view_changed.emit()
+            return
         if self._dragging:
             delta = event.position() - self._last_mouse
             self._offset += delta
@@ -687,6 +715,19 @@ class _CheckerWidget(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.RightButton:
+            was_dragging = self._dragging
+            self._dragging = False
+            self._right_press_pos = None
+            if self._eyedropper_mode:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            if not was_dragging:
+                # 右键单击（未拖拽）→ 弹出发送菜单
+                if self._right_click_callback is not None:
+                    self._right_click_callback(event.globalPosition().toPoint())
+            return
         if self._dragging:
             self._dragging = False
             if self._eyedropper_mode:
@@ -1666,7 +1707,9 @@ class _FolderArrowOverlay(QWidget):
 # =========================================================================
 class ImageViewerTab(QWidget):
     """全能看图 Tab"""
-    # 转移到贴图修改 tab 的信号，参数是临时 PNG 文件路径
+    # 跨板块发送信号：(临时PNG路径, 目标板块索引)
+    transfer_signal = Signal(str, int)
+    # 保留旧信号兼容（主窗口已连接）
     transfer_to_texture = Signal(str)
 
     def __init__(self, parent=None):
@@ -1709,11 +1752,6 @@ class ImageViewerTab(QWidget):
         self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._zoom_label.setStyleSheet("color: #aaa; font-size: 12px;")
 
-        self._btn_transfer = QPushButton("📤 转移至贴图修改")
-        self._btn_transfer.setFixedHeight(32)
-        self._btn_transfer.setEnabled(False)
-        self._btn_transfer.setToolTip("将当前预览的图片以 PNG 格式转移到「贴图修改」tab 中")
-
         self._btn_eyedropper = QPushButton("🔍 吸管取色")
         self._btn_eyedropper.setFixedHeight(32)
         self._btn_eyedropper.setCheckable(True)
@@ -1723,7 +1761,6 @@ class ImageViewerTab(QWidget):
         toolbar.addWidget(self._btn_open_folder)
         toolbar.addWidget(self._btn_fit)
         toolbar.addWidget(self._btn_1to1)
-        toolbar.addWidget(self._btn_transfer)
         toolbar.addWidget(self._btn_eyedropper)
         toolbar.addStretch()
         toolbar.addWidget(QLabel("缩放:"))
@@ -1739,6 +1776,7 @@ class ImageViewerTab(QWidget):
 
         self._viewer = _CheckerWidget(self._viewer_container)
         self._viewer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._viewer._right_click_callback = self._on_viewer_right_click
         container_layout.addWidget(self._viewer)
 
         # 右下角缩略图导航（叠加在 viewer 上方）
@@ -1860,7 +1898,6 @@ class ImageViewerTab(QWidget):
         self._btn_open_folder.clicked.connect(self._on_open_folder)
         self._btn_fit.clicked.connect(self._viewer.fit_in_view)
         self._btn_1to1.clicked.connect(self._viewer.zoom_1to1)
-        self._btn_transfer.clicked.connect(self._on_transfer_to_texture)
         self._btn_eyedropper.toggled.connect(self._toggle_eyedropper)
         self._pdf_bar.page_changed.connect(self._on_pdf_page_changed)
         # _folder_arrows 的回调已在构造时传入，无需额外连接信号
@@ -1979,7 +2016,6 @@ class ImageViewerTab(QWidget):
         # 退出文件夹模式由 _on_open_file / dropEvent 单独处理
         self._info_panel.clear_info()
         self._loading_overlay.hide()
-        self._btn_transfer.setEnabled(False)
         if self._pdf_doc:
             self._pdf_doc.close()
             self._pdf_doc = None
@@ -2068,8 +2104,7 @@ class ImageViewerTab(QWidget):
             QMessageBox.critical(self, "加载失败", f"处理加载结果时出错:\n{e}")
             return
 
-        # 启用转移按钮
-        self._btn_transfer.setEnabled(True)
+        # 启用转移按钮（已移除按钮，此行不再需要）
 
         # 收集并显示文件信息
         if filepath:
@@ -2315,37 +2350,68 @@ class ImageViewerTab(QWidget):
         super().keyPressEvent(event)
 
     def _on_transfer_to_texture(self):
-        """将当前预览的图片以 PNG 格式转移到贴图修改 tab"""
-        # 优先使用 PIL Image（保留原始精度）
-        pil_img = self._pil_image
+        """将当前预览的图片以 PNG 格式转移到贴图修改 tab（保留兼容旧信号）"""
+        pil_img = self._get_current_pil_image()
         if pil_img is None:
-            # 没有 PIL Image 时从 QPixmap 转换
+            return
+        tmp_path = pil_to_temp_png(pil_img, prefix="viewer_transfer_")
+        if tmp_path:
+            self.transfer_to_texture.emit(tmp_path)
+
+    # ── 跨板块通信：发送 & 接收 ─────────────────────────────────────────
+
+    def _on_viewer_right_click(self, global_pos):
+        """全能看图预览区右键单击：弹出发送菜单"""
+        if self._pil_image is None:
             pm = self._viewer.current_pixmap()
             if pm is None or pm.isNull():
-                QMessageBox.warning(self, "无图片", "当前没有可转移的图片，请先打开一张图片。")
                 return
-            # QPixmap → PIL Image
+        menu = build_send_menu(self, TAB_VIEWER, self._send_image_to)
+        menu.exec(global_pos)
+
+    def _send_image_to(self, target_tab: int):
+        """将当前图片发送到目标板块"""
+        pil_img = self._get_current_pil_image()
+        if pil_img is None:
+            return
+        tmp_path = pil_to_temp_png(pil_img, prefix="viewer_send_")
+        if tmp_path:
+            self.transfer_signal.emit(tmp_path, target_tab)
+
+    def _get_current_pil_image(self) -> Optional[Image.Image]:
+        """获取当前预览的 PIL Image"""
+        pil_img = self._pil_image
+        if pil_img is None:
+            pm = self._viewer.current_pixmap()
+            if pm is None or pm.isNull():
+                return None
             qimg = pm.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
             w, h = qimg.width(), qimg.height()
             ptr = qimg.bits()
-            # PySide6 的 bits() 返回 memoryview
             arr = bytes(ptr)
             pil_img = Image.frombytes("RGBA", (w, h), arr, "raw", "RGBA")
+        return pil_img
 
-        # 保存为临时 PNG 文件
+    def receive_image(self, png_path: str):
+        """接收外部发送的图片（完全替换当前状态）"""
+        # 清除文件夹浏览状态
+        self._folder_files = []
+        self._folder_index = -1
+        # 加载图片
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", prefix="viewer_transfer_", delete=False)
-            tmp_path = tmp.name
-            tmp.close()
-            if pil_img.mode != "RGBA":
-                pil_img = pil_img.convert("RGBA")
-            pil_img.save(tmp_path, "PNG")
+            img = Image.open(png_path).convert("RGBA")
+            self._pil_image = img
+            self._current_file = None
+            # 转为 QPixmap 显示
+            data = img.tobytes("raw", "RGBA")
+            qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+            pm = QPixmap.fromImage(qimg.copy())
+            self._viewer.set_pixmap(pm)
+            self._minimap.set_image(pm)
+            self._reposition_minimap()
+            self._info_panel.clear_info()
         except Exception as e:
-            QMessageBox.critical(self, "转移失败", f"保存临时 PNG 文件时出错:\n{e}")
-            return
-
-        # 发出信号，由主窗口负责加载到贴图修改 tab 并切换
-        self.transfer_to_texture.emit(tmp_path)
+            QMessageBox.critical(self, "接收失败", f"加载图片时出错：\n{e}")
 
     # =====================================================================
     #  打开文件夹 & 文件夹导航

@@ -54,6 +54,11 @@ from growth_algorithms import (
     smooth_gray_map,
 )
 
+from tab_transfer import (
+    TAB_GRAYGROWTH, TAB_HINTS, build_send_menu, pil_to_temp_png,
+    RIGHT_CLICK_THRESHOLD,
+)
+
 try:
     import cv2
     _HAS_CV2 = True
@@ -492,6 +497,8 @@ class GrowthCanvas(QWidget):
         self._zoom: float = 1.0
         self._offset: QPoint = QPoint(0, 0)
         self._pan_last: Optional[QPoint] = None  # 右键拖动起点
+        self._right_press_pos: Optional[QPoint] = None  # 右键按下位置（5px阈值）
+        self._right_click_callback = None  # 右键单击回调
 
         # 鼠标位置（用于画笔圆圈预览）
         self._cursor_pos: Optional[QPoint] = None
@@ -636,12 +643,12 @@ class GrowthCanvas(QWidget):
 
         p.end()
 
-    # ── 鼠标事件 ──────────────────────────────────────────────────────
+    # ── 鼠标事件 ───────────────────────────────────────────────────────
     def mousePressEvent(self, e):
         if e.button() == Qt.RightButton:
-            # 右键拖动平移
-            self._pan_last = e.pos()
-            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            # 右键：记录按下位置，延迟判断是单击还是拖拽
+            self._right_press_pos = e.pos()
+            self._pan_last = None  # 还没进入拖拽
         elif e.button() == Qt.LeftButton and self._show_cursor:
             # 仅单图模式下允许绘制
             self._drawing = True
@@ -650,7 +657,16 @@ class GrowthCanvas(QWidget):
 
     def mouseMoveEvent(self, e):
         self._cursor_pos = e.pos()
-        if self._pan_last is not None and (e.buttons() & Qt.RightButton):
+        # 右键移动：检查是否超过阈值进入拖拽
+        if self._right_press_pos is not None and (e.buttons() & Qt.RightButton):
+            if self._pan_last is None:
+                delta = e.pos() - self._right_press_pos
+                dist = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                if dist >= RIGHT_CLICK_THRESHOLD:
+                    self._pan_last = e.pos()
+                    self.setCursor(QCursor(Qt.ClosedHandCursor))
+                return  # 阈值内不做任何事
+            # 已进入拖拽模式
             delta = e.pos() - self._pan_last
             self._offset += delta
             self._pan_last = e.pos()
@@ -665,8 +681,14 @@ class GrowthCanvas(QWidget):
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.RightButton:
+            was_panning = self._pan_last is not None
             self._pan_last = None
+            self._right_press_pos = None
             self.setCursor(QCursor(Qt.CrossCursor))
+            if not was_panning:
+                # 右键单击（未拖拽）→ 弹出发送菜单
+                if self._right_click_callback is not None:
+                    self._right_click_callback(e.globalPosition().toPoint())
         elif e.button() == Qt.LeftButton and self._drawing:
             self._drawing = False
             if self._stroke_points and self.on_stroke_finished:
@@ -676,7 +698,6 @@ class GrowthCanvas(QWidget):
                 self.on_stroke_finished(pts, value)
             self._stroke_points = []
             self.update()
-
     def leaveEvent(self, e):
         self._cursor_pos = None
         self.update()
@@ -817,6 +838,8 @@ class _SeqGenWorker(QThread):
 class GrowthGrayTab(ExportDirMixin, QWidget):
     """生长灰度图生成器 Tab"""
     _export_dir_cache_name = "growth_gray_last_export_dir.txt"
+    # 跨板块发送信号：(临时PNG路径, 目标板块索引)
+    transfer_signal = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1018,6 +1041,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self.canvas = GrowthCanvas()
         self.canvas.on_stroke_finished = self._on_stroke_finished
         self.canvas.on_drop_files = self._on_canvas_drop
+        self.canvas._right_click_callback = self._on_canvas_right_click
         mid.addWidget(self.canvas, 1)
 
         # 笔刷控制（单图模式下显示，序列帧模式下隐藏）
@@ -3808,3 +3832,22 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
 
         except Exception:
             pass  # 实时预览静默失败
+
+    # ── 跨板块通信：发送 ──────────────────────────────────────────────
+
+    def _on_canvas_right_click(self, global_pos):
+        """灰度图画布右键单击：弹出发送菜单（发送素材图）"""
+        # 没有素材图时不弹菜单
+        if self.source_image is None:
+            return
+        hint = TAB_HINTS.get(TAB_GRAYGROWTH)
+        menu = build_send_menu(self, TAB_GRAYGROWTH, self._send_source_image, hint=hint)
+        menu.exec(global_pos)
+
+    def _send_source_image(self, target_tab: int):
+        """将原始素材图发送到目标板块"""
+        if self.source_image is None:
+            return
+        tmp_path = pil_to_temp_png(self.source_image, prefix="growth_send_")
+        if tmp_path:
+            self.transfer_signal.emit(tmp_path, target_tab)

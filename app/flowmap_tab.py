@@ -25,7 +25,7 @@ from export_dir_mixin import ExportDirMixin
 from PIL import Image
 
 from PySide6.QtCore import (
-    Qt, QPoint, QRect, QTimer, QRegularExpression,
+    Qt, QPoint, QRect, QTimer, QRegularExpression, Signal,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QCursor,
@@ -44,6 +44,11 @@ CANVAS_H = 512
 # flat normal 默认基准值：向量 (0,0,1) → packed RGB(128,128,255)
 FLAT_NORMAL_VEC  = (0.0, 0.0, 1.0)   # float xyz
 FLAT_NORMAL_RGB  = (128, 128, 255)    # packed uint8
+
+from tab_transfer import (
+    TAB_FLOWMAP, TAB_HINTS, build_send_menu, pil_to_temp_png,
+    RIGHT_CLICK_THRESHOLD,
+)
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────
@@ -360,6 +365,8 @@ class VectorMapCanvas(QWidget):
         self._panning        = False
         self._pan_start_pos: Optional[QPoint] = None   # 右键按下时的 widget 坐标
         self._pan_start_off: Optional[QPoint] = None   # 右键按下时的 _pan_offset
+        self._right_press_pos: Optional[QPoint] = None  # 右键按下位置（用于5px阈值判断）
+        self._right_click_callback = None  # 右键单击回调
 
         # ── Undo 历史栈（每次落笔前保存快照）
         self._undo_stack: list = []          # list of np.ndarray (HxWx3 float32)
@@ -821,23 +828,32 @@ class VectorMapCanvas(QWidget):
                 # 跟随模式：落笔不绘制，仅记录位置，等 mouseMoveEvent 有方向后再绘制
                 self._last_cpos = cp
         elif e.button() == Qt.RightButton:
-            self._panning = True
+            self._right_press_pos = e.pos()
+            self._panning = False
             self._pan_start_pos = e.pos()
             self._pan_start_off = QPoint(self._pan_offset)
-            self.setCursor(QCursor(Qt.ClosedHandCursor))
 
     def mouseMoveEvent(self, e):
         # 更新鼠标位置（笔刷预览圆用）
         self._mouse_widget_pos = e.pos()
 
-        # 右键拖动画布
-        if self._panning and self._pan_start_pos is not None:
-            delta = e.pos() - self._pan_start_pos
-            self._pan_offset = self._pan_start_off + delta
-            self._clamp_pan()
-            self._update_pix_rect()
-            self.update()
-            return
+        # 右键拖动画布（带 5px 阈值）
+        if self._right_press_pos is not None and (e.buttons() & Qt.RightButton):
+            if not self._panning:
+                delta = e.pos() - self._right_press_pos
+                dist = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                if dist >= RIGHT_CLICK_THRESHOLD:
+                    self._panning = True
+                    self.setCursor(QCursor(Qt.ClosedHandCursor))
+                return  # 阈值内不做任何事
+            # 已进入拖拽模式
+            if self._pan_start_pos is not None:
+                delta = e.pos() - self._pan_start_pos
+                self._pan_offset = self._pan_start_off + delta
+                self._clamp_pan()
+                self._update_pix_rect()
+                self.update()
+                return
 
         # 只更新笔刷预览圆区域，避免每次鼠标移动都触发全量重绘
         # 注意：流动动画由定时器驱动，不需要鼠标移动触发
@@ -881,10 +897,16 @@ class VectorMapCanvas(QWidget):
             self._drawing = False
             self._last_cpos = None
         elif e.button() == Qt.RightButton:
+            was_panning = self._panning
             self._panning = False
             self._pan_start_pos = None
             self._pan_start_off = None
+            self._right_press_pos = None
             self.setCursor(QCursor(Qt.CrossCursor))
+            if not was_panning:
+                # 右键单击（未拖拽）→ 弹出发送菜单
+                if self._right_click_callback is not None:
+                    self._right_click_callback(e.globalPosition().toPoint())
 
     def leaveEvent(self, e):
         """鼠标离开绘制区时隐藏笔刷预览圆圈。"""
@@ -1061,6 +1083,8 @@ class VectorResultWidget(QWidget):
 class FlowMapTab(ExportDirMixin, QWidget):
     """向量场贴图编辑器 Tab（法线绘制）"""
     _export_dir_cache_name = "flowmap_last_export_dir.txt"
+    # 跨板块发送信号：(临时PNG路径, 目标板块索引)
+    transfer_signal = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1260,6 +1284,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
         # 主绘制区
         self.canvas = VectorMapCanvas()
         self.canvas.on_normal_updated = self._on_normal_updated
+        self.canvas._right_click_callback = self._on_canvas_right_click
 
         # 原图预览开关
         preview_header = QHBoxLayout()
@@ -1662,3 +1687,23 @@ class FlowMapTab(ExportDirMixin, QWidget):
             QMessageBox.information(self, "导出完成", f"已导出：\n{path}")
         except Exception as ex:
             QMessageBox.critical(self, "导出失败", str(ex))
+
+    # ── 跨板块通信：发送 ───────────────────────────────────────────────────
+
+    def _on_canvas_right_click(self, global_pos):
+        """法线绘制画布右键单击：弹出发送菜单（发送参考图）"""
+        # 没有参考图时不弹菜单
+        if self.drop_ref._src_img is None:
+            return
+        hint = TAB_HINTS.get(TAB_FLOWMAP)
+        menu = build_send_menu(self, TAB_FLOWMAP, self._send_ref_image, hint=hint)
+        menu.exec(global_pos)
+
+    def _send_ref_image(self, target_tab: int):
+        """将参考图发送到目标板块"""
+        ref_img = self.drop_ref._src_img
+        if ref_img is None:
+            return
+        tmp_path = pil_to_temp_png(ref_img, prefix="flowmap_send_")
+        if tmp_path:
+            self.transfer_signal.emit(tmp_path, target_tab)

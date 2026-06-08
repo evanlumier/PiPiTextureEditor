@@ -8,7 +8,7 @@ from PIL import Image
 
 from export_dir_mixin import ExportDirMixin
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression
+from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression, Signal
 from PySide6.QtGui import (
     QRegularExpressionValidator,
     QPixmap, QImage, QPainter, QPen, QColor, QDrag, QFontMetrics
@@ -17,6 +17,10 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QMessageBox, QGroupBox, QComboBox, QSplitter,
     QCheckBox, QSpinBox, QAbstractItemView, QLineEdit
+)
+
+from tab_transfer import (
+    TAB_SPRITE, build_send_menu, pil_to_temp_png, RIGHT_CLICK_THRESHOLD,
 )
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
@@ -373,6 +377,9 @@ class SheetPreviewLabel(QLabel):
         # 选中描边颜色（现代蓝，随你改）
         self.sel_color = QColor(137, 180, 250, 230)
 
+        # 右键单击回调（用于发送菜单）
+        self._right_click_callback: Optional[Callable] = None
+
     def set_sheet(self, pix: Optional[QPixmap], cols: int, rows: int, count: int):
         self._pix = pix
         self._cols = max(1, int(cols))
@@ -536,6 +543,11 @@ class SheetPreviewLabel(QLabel):
         p.end()
 
     def mousePressEvent(self, event):
+        # 右键单击：弹出发送菜单（需要有选中帧）
+        if event.button() == Qt.RightButton:
+            if self._selected and self._right_click_callback is not None:
+                self._right_click_callback(event.globalPosition().toPoint())
+            return
         if event.button() == Qt.LeftButton:
             self._press_pos = event.pos()
             idx = self._pos_to_index(event.pos())
@@ -652,6 +664,8 @@ class SheetPreviewLabel(QLabel):
         event.acceptProposedAction()
 class SpriteSheetTab(ExportDirMixin, QWidget):
     _export_dir_cache_name = "sprite_last_export_dir.txt"
+    # 跨板块发送信号：(临时PNG路径, 目标板块索引)
+    transfer_signal = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -879,6 +893,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.sheet_label.setMinimumSize(520, 320)
         self.sheet_label.setFocusPolicy(Qt.StrongFocus)
         self.sheet_label.installEventFilter(self)
+        self.sheet_label._right_click_callback = self._on_sheet_right_click
 
 
         self.gif_title = QLabel("GIF预览")
@@ -1780,3 +1795,27 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             QMessageBox.information(self, "完成", f"已导出：\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败：\n{e}")
+
+    # ── 跨板块通信：发送 ──────────────────────────────────────────────
+
+    def _on_sheet_right_click(self, global_pos):
+        """精灵图预览区右键单击：弹出发送菜单（需要有选中帧）"""
+        sel = self.sheet_label.selected_set()
+        if not sel or not self.frames_rgba:
+            return
+        menu = build_send_menu(self, TAB_SPRITE, self._send_selected_frame)
+        menu.exec(global_pos)
+
+    def _send_selected_frame(self, target_tab: int):
+        """将选中的第一帧发送到目标板块"""
+        sel = sorted(self.sheet_label.selected_set())
+        if not sel or not self.frames_rgba:
+            return
+        # 取第一个选中帧
+        idx = sel[0]
+        if idx >= len(self.frames_rgba):
+            return
+        pil_img = self.frames_rgba[idx]
+        tmp_path = pil_to_temp_png(pil_img, prefix="sprite_send_")
+        if tmp_path:
+            self.transfer_signal.emit(tmp_path, target_tab)

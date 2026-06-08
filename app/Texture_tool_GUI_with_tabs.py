@@ -60,6 +60,10 @@ from sprite_sheet_tab import SpriteSheetTab
 from flowmap_tab import FlowMapTab
 from growth_gray_tab import GrowthGrayTab
 from image_viewer_tab import ImageViewerTab
+from tab_transfer import (
+    TAB_TEXTURE, TAB_SPRITE, TAB_FLOWMAP, TAB_GRAYGROWTH, TAB_VIEWER,
+    TAB_NAMES, TAB_HINTS, build_send_menu, pil_to_temp_png, qpixmap_to_pil,
+)
 from version import __version__
 from ue4_sync import get_sync_manager
 
@@ -610,8 +614,14 @@ class MainWindow(ExportDirMixin, QMainWindow):
         self._growth_tab = growth_tab
         self._image_viewer_tab = image_viewer_tab
 
-        # 连接全能看图的「转移至贴图修改」信号
+        # 连接全能看图的「转移至贴图修改」信号（保留兼容）
         image_viewer_tab.transfer_to_texture.connect(self._on_transfer_from_viewer)
+
+        # 连接各板块的跨板块通信信号
+        sprite_tab.transfer_signal.connect(self._on_tab_transfer)
+        flowmap_tab.transfer_signal.connect(self._on_tab_transfer)
+        growth_tab.transfer_signal.connect(self._on_tab_transfer)
+        image_viewer_tab.transfer_signal.connect(self._on_tab_transfer)
 
         # 连接 tab 切换信号，更新 UE4 按钮状态
         tabs.currentChanged.connect(self._on_tab_changed)
@@ -623,6 +633,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
         self.preview_label.setMinimumSize(680, 560)
         self.preview_label._on_drop_callback = self.load_image
         self.preview_label._parent_window = self
+        self.preview_label._right_click_callback = self._on_preview_right_click
 
         left_layout.addWidget(self.preview_label, 1)
 
@@ -1614,14 +1625,113 @@ class MainWindow(ExportDirMixin, QMainWindow):
 
     def _on_transfer_from_viewer(self, tmp_png_path: str):
         """从全能看图 tab 接收转移过来的图片（临时 PNG 文件）"""
+        self._receive_to_texture(tmp_png_path)
+
+    def _on_tab_transfer(self, tmp_png_path: str, target_tab: int):
+        """统一处理各板块发出的跨板块通信信号"""
+        self._route_to_tab(target_tab, tmp_png_path)
+
+    # ── 跨板块通信：发送 & 接收 ──────────────────────────────────────
+
+    def _on_preview_right_click(self, global_pos):
+        """贴图修改板块：右键单击预览区弹出发送菜单"""
+        # 没有图片时不弹菜单
+        if self.preview_label.pixmap() is None:
+            return
+        menu = build_send_menu(self, TAB_TEXTURE, self._send_image_to)
+        menu.exec(global_pos)
+
+    def _send_image_to(self, target_tab: int):
+        """贴图修改板块：将当前预览图发送到目标板块"""
+        pm = self.preview_label.pixmap()
+        pil_img = qpixmap_to_pil(pm)
+        if pil_img is None:
+            return
+        tmp_path = pil_to_temp_png(pil_img, prefix="texture_send_")
+        if tmp_path is None:
+            return
+        self._route_to_tab(target_tab, tmp_path)
+
+    def _route_to_tab(self, target_tab: int, tmp_png_path: str):
+        """统一路由：将临时 PNG 文件发送到目标板块并切换"""
+        try:
+            if target_tab == TAB_TEXTURE:
+                self._receive_to_texture(tmp_png_path)
+            elif target_tab == TAB_SPRITE:
+                self._receive_to_sprite(tmp_png_path)
+            elif target_tab == TAB_FLOWMAP:
+                self._receive_to_flowmap(tmp_png_path)
+            elif target_tab == TAB_GRAYGROWTH:
+                self._receive_to_growth(tmp_png_path)
+            elif target_tab == TAB_VIEWER:
+                self._receive_to_viewer(tmp_png_path)
+        except Exception as e:
+            QMessageBox.critical(self, "发送失败", f"发送图片时出错：\n{e}")
+            # 清理临时文件
+            try:
+                if os.path.exists(tmp_png_path):
+                    os.remove(tmp_png_path)
+            except OSError:
+                pass
+
+    def _receive_to_texture(self, tmp_png_path: str):
+        """接收图片到贴图修改板块"""
         try:
             self.load_image(tmp_png_path)
-            # 切换到贴图修改 tab（索引 0）
-            self._tabs.setCurrentIndex(0)
+            self._tabs.setCurrentIndex(TAB_TEXTURE)
         except Exception as e:
-            QMessageBox.critical(self, "转移失败", f"加载转移的图片时出错：\n{e}")
+            QMessageBox.critical(self, "接收失败", f"加载图片时出错：\n{e}")
         finally:
-            # 清理临时文件
+            try:
+                if os.path.exists(tmp_png_path):
+                    os.remove(tmp_png_path)
+            except OSError:
+                pass
+
+    def _receive_to_sprite(self, tmp_png_path: str):
+        """接收图片到精灵图板块（追加为新帧）"""
+        try:
+            self._sprite_tab.add_paths([tmp_png_path])
+            self._tabs.setCurrentIndex(TAB_SPRITE)
+        except Exception as e:
+            QMessageBox.critical(self, "接收失败", f"加载图片到精灵图时出错：\n{e}")
+
+    def _receive_to_flowmap(self, tmp_png_path: str):
+        """接收图片到法线绘制板块（作为参考图）"""
+        try:
+            self._flowmap_tab.drop_ref._load(tmp_png_path)
+            self._tabs.setCurrentIndex(TAB_FLOWMAP)
+        except Exception as e:
+            QMessageBox.critical(self, "接收失败", f"加载参考图时出错：\n{e}")
+        finally:
+            try:
+                if os.path.exists(tmp_png_path):
+                    os.remove(tmp_png_path)
+            except OSError:
+                pass
+
+    def _receive_to_growth(self, tmp_png_path: str):
+        """接收图片到灰度图板块（作为单图素材）"""
+        try:
+            self._growth_tab._load_single_from_path(tmp_png_path)
+            self._tabs.setCurrentIndex(TAB_GRAYGROWTH)
+        except Exception as e:
+            QMessageBox.critical(self, "接收失败", f"加载素材图时出错：\n{e}")
+        finally:
+            try:
+                if os.path.exists(tmp_png_path):
+                    os.remove(tmp_png_path)
+            except OSError:
+                pass
+
+    def _receive_to_viewer(self, tmp_png_path: str):
+        """接收图片到全能看图板块（完全替换当前状态）"""
+        try:
+            self._image_viewer_tab.receive_image(tmp_png_path)
+            self._tabs.setCurrentIndex(TAB_VIEWER)
+        except Exception as e:
+            QMessageBox.critical(self, "接收失败", f"加载图片到全能看图时出错：\n{e}")
+        finally:
             try:
                 if os.path.exists(tmp_png_path):
                     os.remove(tmp_png_path)
