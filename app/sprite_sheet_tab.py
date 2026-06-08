@@ -842,8 +842,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         )
         self.list_widget.itemSelectionChanged.connect(self._on_list_selection_changed)
         self.list_widget.installEventFilter(self)
-        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_widget.customContextMenuRequested.connect(self._on_list_context_menu)
+
         # rowsMoved 对 Qt 内部 move 并不总触发，这里仍保留，但我们也在 selection/rebuild 时保持一致
         self.list_widget.model().rowsMoved.connect(lambda *args: self._on_list_reordered())
         self.list_widget.model().layoutChanged.connect(lambda *args: self._on_list_reordered())
@@ -880,8 +879,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.sheet_label.setMinimumSize(520, 320)
         self.sheet_label.setFocusPolicy(Qt.StrongFocus)
         self.sheet_label.installEventFilter(self)
-        self.sheet_label.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.sheet_label.customContextMenuRequested.connect(self._on_sheet_context_menu)
+
 
         self.gif_title = QLabel("GIF预览")
         self.gif_title.setStyleSheet("font-weight:700; color:#89b4fa; padding:4px 2px;")
@@ -1227,37 +1225,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         has_sel = bool(self.list_widget.selectedItems()) or bool(self.sheet_label.selected_set())
         self.btn_delete.setEnabled(has_sel and bool(self.paths))
 
-    def _on_list_context_menu(self, pos):
-        """左侧列表右键菜单"""
-        from PySide6.QtWidgets import QMenu
-        sel = self.list_widget.selectedItems()
-        if not sel:
-            return
-        menu = QMenu(self)
-        count = len(sel)
-        if count == 1:
-            action_del = menu.addAction(f"删除 {sel[0].text()}")
-        else:
-            action_del = menu.addAction(f"删除选中的 {count} 张图片")
-        action_del.triggered.connect(self.delete_selected)
-        menu.exec(self.list_widget.viewport().mapToGlobal(pos))
 
-    def _on_sheet_context_menu(self, pos):
-        """精灵图预览区右键菜单"""
-        from PySide6.QtWidgets import QMenu
-        sel = self.sheet_label.selected_set()
-        if not sel:
-            return
-        menu = QMenu(self)
-        count = len(sel)
-        if count == 1:
-            idx = next(iter(sel))
-            name = self._cell_name(idx)
-            action_del = menu.addAction(f"删除 {name}")
-        else:
-            action_del = menu.addAction(f"删除选中的 {count} 张图片")
-        action_del.triggered.connect(self.delete_selected)
-        menu.exec(self.sheet_label.mapToGlobal(pos))
 
     # ---------------- key handling (Delete/Backspace) ----------------
     def eventFilter(self, obj, event):

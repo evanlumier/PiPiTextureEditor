@@ -291,14 +291,6 @@ class DropRefWidget(QWidget):
                        "📂 点击或拖拽\n导入参考图")
         p.end()
 
-    def contextMenuEvent(self, e):
-        if self._src_img is not None:
-            menu = QMenu(self)
-            act_clear = QAction("清除参考图", self)
-            act_clear.triggered.connect(self.clear_image)
-            menu.addAction(act_clear)
-            menu.exec(e.globalPos())
-
 
 # ── 主绘制画布（Normal Map 编辑器 + UV offset 流动预览）──────────────────
 class VectorMapCanvas(QWidget):
