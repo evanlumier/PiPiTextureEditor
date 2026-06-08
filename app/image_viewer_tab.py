@@ -2104,8 +2104,6 @@ class ImageViewerTab(QWidget):
             QMessageBox.critical(self, "加载失败", f"处理加载结果时出错:\n{e}")
             return
 
-        # 启用转移按钮（已移除按钮，此行不再需要）
-
         # 收集并显示文件信息
         if filepath:
             self._show_file_info(filepath, ext)
@@ -2397,6 +2395,7 @@ class ImageViewerTab(QWidget):
         # 清除文件夹浏览状态
         self._folder_files = []
         self._folder_index = -1
+        self._folder_arrows.hide_all()
         # 加载图片
         try:
             img = Image.open(png_path).convert("RGBA")

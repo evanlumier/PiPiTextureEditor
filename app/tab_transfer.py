@@ -2,21 +2,20 @@
 """
 tab_transfer.py - 跨板块通信管理模块
 
-提供各板块之间"发送到..."功能的统一基础设施：
+提供各板块之间“发送到...”功能的统一基础设施：
 - 板块枚举定义
 - 右键菜单创建
 - 图片转临时 PNG 的工具函数
-- 右键单击/拖拽区分的 Mixin 类
+- 右键单击/拖拽区分的阈值常量
 """
-
 import os
 import tempfile
 from typing import Optional, Callable
 
 from PIL import Image
 
-from PySide6.QtCore import Qt, Signal, QPointF
-from PySide6.QtGui import QAction, QImage, QPixmap, QMouseEvent, QCursor
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QMenu, QWidget
 
 
@@ -135,72 +134,3 @@ def build_send_menu(
         action.triggered.connect(lambda checked, t=tab_idx: on_send(t))
 
     return menu
-
-
-class RightClickSendMixin:
-    """
-    为画布控件提供"右键单击弹菜单 / 右键拖拽平移"区分能力的 Mixin。
-
-    使用方法：
-    1. 在目标控件类中混入此 Mixin
-    2. 在 __init__ 中调用 self._init_right_click_send()
-    3. 在 mousePressEvent / mouseMoveEvent / mouseReleaseEvent 中
-       调用对应的 _rcs_* 方法
-    4. 实现 _on_right_click_send(pos) 方法来处理右键单击弹菜单
-    """
-
-    def _init_right_click_send(self):
-        """初始化右键单击/拖拽区分所需的状态变量。"""
-        self._rcs_press_pos: Optional[QPointF] = None
-        self._rcs_is_dragging: bool = False
-
-    def _rcs_press(self, event: QMouseEvent) -> bool:
-        """
-        在 mousePressEvent 中调用。
-        返回 True 表示已处理（右键按下），调用方应 return。
-        """
-        if event.button() == Qt.RightButton:
-            self._rcs_press_pos = event.position()
-            self._rcs_is_dragging = False
-            return True
-        return False
-
-    def _rcs_move(self, event: QMouseEvent) -> bool:
-        """
-        在 mouseMoveEvent 中调用。
-        返回 True 表示已超过阈值，进入拖拽模式，调用方应执行平移逻辑。
-        返回 False 表示还在阈值内或非右键状态。
-        """
-        if self._rcs_press_pos is None:
-            return False
-        if not (event.buttons() & Qt.RightButton):
-            return False
-        if self._rcs_is_dragging:
-            return True  # 已经在拖拽中
-        # 检查是否超过阈值
-        delta = event.position() - self._rcs_press_pos
-        dist = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
-        if dist >= RIGHT_CLICK_THRESHOLD:
-            self._rcs_is_dragging = True
-            return True
-        return False
-
-    def _rcs_release(self, event: QMouseEvent) -> bool:
-        """
-        在 mouseReleaseEvent 中调用。
-        返回 True 表示这是一次"右键单击"（未拖拽），调用方应弹出菜单。
-        返回 False 表示这是一次拖拽结束或非右键。
-        """
-        if event.button() != Qt.RightButton:
-            return False
-        was_dragging = self._rcs_is_dragging
-        self._rcs_press_pos = None
-        self._rcs_is_dragging = False
-        return not was_dragging
-
-    def _on_right_click_send(self, global_pos):
-        """
-        子类需要实现此方法：在右键单击时弹出发送菜单。
-        参数 global_pos 是全局坐标，用于 menu.exec(global_pos)。
-        """
-        raise NotImplementedError
