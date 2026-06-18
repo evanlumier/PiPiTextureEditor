@@ -76,7 +76,7 @@ SUPPORTED_EXTS = [".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"]
 
 from utils import pil_to_qpixmap, to_bw_rgba
 
-from dialogs import PixRect, CropCanvas, CropDialog, MaskThresholdDialog
+from dialogs import CropDialog, MaskThresholdDialog
 
 from widgets import DropLabel, CheckerLabel, StackedTextTabBar
 
@@ -438,7 +438,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
         self.setStyleSheet(_style)
 
         self.src_path: Optional[str] = None
-        self.source_color: Optional[Image.Image] = None  # 最初导入（永远不变）
+        self.source_color: Optional[Image.Image] = None  # 当前基准图（图像调整确认后更新）
         self.master_color: Optional[Image.Image] = None  # 当前基础（裁切后会替换为裁切结果）
 
         # UE4 来源信息：按 Tab 索引独立存储，每个 Tab 有自己的来源信息
@@ -655,9 +655,9 @@ class MainWindow(ExportDirMixin, QMainWindow):
         mask_gen_row.addWidget(btn_mask_gen, 4)
         mask_gen_row.addWidget(btn_reset_mask, 1)
 
-        # 裁切 + 重置（80%/20%）
+        # 图像调整 + 重置（80%/20%）
         crop_row = QHBoxLayout()
-        btn_crop = QPushButton("裁切/旋转")
+        btn_crop = QPushButton("图像调整")
         btn_crop.setStyleSheet("text-align:center;")
         btn_crop.setMinimumWidth(340)
         btn_crop.clicked.connect(self.open_crop_dialog)
@@ -1403,6 +1403,17 @@ class MainWindow(ExportDirMixin, QMainWindow):
         if tga_path and os.path.isfile(tga_path):
             try:
                 img = Image.open(tga_path)
+
+                # ── 前置闸口：透明通道排除 ──
+                # 法线图不会有透明通道，如果图片存在大量非完全不透明像素，
+                # 则直接跳过像素分析，降级到名字/路径判断
+                if img.mode in ("RGBA", "LA", "PA"):
+                    alpha = np.array(img.split()[-1], dtype=np.uint8)
+                    non_opaque_ratio = np.count_nonzero(alpha < 255) / alpha.size
+                    if non_opaque_ratio > 0.05:
+                        # 超过 5% 的像素有透明度，不可能是法线图
+                        raise Exception("has_alpha_skip_pixel_analysis")
+
                 # 转为 RGB 进行分析
                 if img.mode != "RGB":
                     img = img.convert("RGB")
@@ -1742,13 +1753,16 @@ class MainWindow(ExportDirMixin, QMainWindow):
     def open_crop_dialog(self):
         if self.source_color is None:
             return
-        dlg = CropDialog(self.source_color, self)  # 永远从最初图裁
+        dlg = CropDialog(self.source_color, self)
         if dlg.exec() == QDialog.Accepted and dlg.result_img is not None:
-            self.master_color = dlg.result_img.convert("RGBA")
+            result = dlg.result_img.convert("RGBA")
+            # 图像调整是破坏性操作（改变尺寸/几何），确认后更新基准图
+            self.source_color = result
+            self.master_color = result.copy()
             self.rebuild_working()
 
     def reset_crop(self):
-        # 取消裁切：回到最初导入图（但保留你当前黑白/尺寸/亮度对比度设置）
+        # 重置图像调整：回到基准图（图像调整确认后的状态）
         if self.source_color is None:
             return
         self.master_color = self.source_color.copy()
@@ -2002,7 +2016,13 @@ class MainWindow(ExportDirMixin, QMainWindow):
         self.update_info()
 
     def get_export_basename(self) -> str:
-        return self.output_basename if self.output_basename else self.original_base()
+        if self.output_basename:
+            return self.output_basename
+        # 如果有 UE4 来源信息，优先使用 UE4 资产名称
+        tab0_source = self._ue4_source_info_per_tab.get(0)
+        if tab0_source and tab0_source.get("asset_name"):
+            return tab0_source["asset_name"]
+        return self.original_base()
 
     def validate_export_name(self, name: str) -> bool:
         return bool(VALID_NAME_RE.fullmatch(name))
@@ -2018,12 +2038,16 @@ class MainWindow(ExportDirMixin, QMainWindow):
             base = to_bw_rgba(base)
 
         if self.has_unmult:
-            # Unmult（去除黑底）：Alpha = max(R, G, B)，RGB 保持不变
+            # Unmult（去除黑底）：Alpha = min(原始Alpha, max(R, G, B))
             # 原理：纯黑(0,0,0)→透明，亮色→不透明，与 AE Unmult 插件一致
+            # 使用 min() 确保不会覆盖已有的透明度（如羽化渐变）
             import numpy as np
             arr = np.array(base, dtype=np.uint8)
             rgb = arr[:, :, :3]
-            new_alpha = np.max(rgb, axis=2)  # max(R, G, B) 作为 alpha
+            original_alpha = arr[:, :, 3]
+            unmult_alpha = np.max(rgb, axis=2)  # max(R, G, B) 作为 unmult alpha
+            # 取两者较小值：保留羽化等已有透明度，同时去除黑底
+            new_alpha = np.minimum(original_alpha, unmult_alpha)
             result = np.dstack([rgb, new_alpha])
             base = Image.fromarray(result, "RGBA")
 
@@ -2257,16 +2281,9 @@ class MainWindow(ExportDirMixin, QMainWindow):
     def get_ue4_export_name(self) -> str:
         """贴图修改 tab：返回导出到 UE4 时的资产名称。
         优先级：用户手动命名 > UE4 来源名称 > 文件原始名称
+        （逻辑与 get_export_basename 一致，直接委托）
         """
-        # 如果用户手动应用了命名，优先使用
-        if self.output_basename:
-            return self.output_basename
-        # 如果有 UE4 来源信息（贴图修改 Tab），使用原始资产名称
-        tab0_source = self._ue4_source_info_per_tab.get(0)
-        if tab0_source and tab0_source.get("asset_name"):
-            return tab0_source["asset_name"]
-        # 兜底：使用文件原始名称
-        return self.original_base()
+        return self.get_export_basename()
 
     # ── Tab 切换回调 ──────────────────────────────────────────────────
     def _on_tab_changed(self, index: int):
@@ -2332,20 +2349,14 @@ class MainWindow(ExportDirMixin, QMainWindow):
 
         export_name = tab_obj.get_ue4_export_name()
 
-        # 如果当前 Tab 有 UE4 来源信息，优先使用来源名称作为导出名称
-        # （从 UE4 导入的图片，导出时默认覆盖回原资产）
+        # 非贴图修改 Tab：来源信息存储在 MainWindow 中，Tab 自身无法感知，
+        # 需要在此处补充来源名称覆盖（仅当 Tab 没有用户自定义名称时）
         current_tab_idx = self._tabs.currentIndex()
         current_source_info = self._ue4_source_info_per_tab.get(current_tab_idx)
-        if current_source_info and current_source_info.get("asset_name"):
-            # 只有当 Tab 自身没有用户主动设置的名称时，才用来源名称
-            # 贴图修改 Tab 的 get_ue4_export_name 已经内部处理了来源名称优先级
-            # 其他 Tab：检查是否有用户主动设置的 _output_basename
-            if current_tab_idx != 0:  # 非贴图修改 Tab
-                tab_has_custom_name = getattr(tab_obj, '_output_basename', None)
-                if not tab_has_custom_name:
-                    export_name = current_source_info["asset_name"]
-
-        # 获取 UE4 目标路径
+        if current_tab_idx != 0 and current_source_info and current_source_info.get("asset_name"):
+            tab_has_custom_name = getattr(tab_obj, '_output_basename', None)
+            if not tab_has_custom_name:
+                export_name = current_source_info["asset_name"]
         target_path = self.ue4_target_path.text().strip()
         if not target_path:
             QMessageBox.warning(self, "提示", "请填写 UE4 目标路径（如 /Game/Art/UI/Textures）")
@@ -2356,7 +2367,6 @@ class MainWindow(ExportDirMixin, QMainWindow):
             return
 
         # ── UE4 来源信息检查：改名警告 + 路径变更检测 ──
-        # 复用前面已获取的 current_source_info（按当前 Tab 索引独立）
         if current_source_info:
             source_name = current_source_info.get("asset_name", "")
             source_path = current_source_info.get("asset_path", "")
@@ -2596,6 +2606,19 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     try:
         app = QApplication(sys.argv)
+
+        # 禁用所有文本输入框的右键上下文菜单（Undo/Redo/Cut/Copy/Paste）
+        from PySide6.QtCore import QEvent, QObject
+
+        class _NoContextMenuFilter(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.ContextMenu:
+                    if isinstance(obj, (QLineEdit, QSpinBox)):
+                        return True  # 拦截，不弹出菜单
+                return super().eventFilter(obj, event)
+
+        _ctx_filter = _NoContextMenuFilter(app)
+        app.installEventFilter(_ctx_filter)
         # 给整个应用设置图标（任务栏图标，多路径回退查找）
         _ico_name = "TextureToolGUI.ico"
         _candidates = []
