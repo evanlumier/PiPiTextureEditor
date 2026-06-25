@@ -48,6 +48,9 @@ _RELEASE_DOWNLOAD_URL_TEMPLATE = f"https://github.com/{GITHUB_REPO}/releases/dow
 # ── Release 页面 changelog 地址（用于获取更新说明）──
 _RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
+# ── Changelog 文件地址（通过 raw CDN 获取，无 rate limit）──
+_CHANGELOG_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/CHANGELOG"
+
 # 重试配置
 _MAX_RETRIES = 2          # 最多重试几次
 _RETRY_DELAY = 2          # 重试之间等待秒数
@@ -445,11 +448,21 @@ def _fetch_remote_version() -> str | None:
 # ── 内部：获取 Release changelog（可选，失败不影响更新）──────────
 def _fetch_changelog(version: str) -> str:
     """
-    尝试从 GitHub API 获取 Release 的 changelog（body 字段）。
+    尝试从仓库的 CHANGELOG 文件获取更新说明。
+    优先通过 raw.githubusercontent.com（无 rate limit），
+    失败时 fallback 到 GitHub API（有 rate limit）。
     这是可选操作，失败时返回默认文本，不影响更新流程。
     """
+    # 方案1：通过 raw CDN 获取 CHANGELOG 文件（无 rate limit，推荐）
     try:
-        # 尝试通过 curl 获取（可能因 rate limit 失败，无所谓）
+        text = _fetch_text_via_curl(_CHANGELOG_URL, timeout=10)
+        if text and text.strip():
+            return text.strip()
+    except Exception:
+        pass
+
+    # 方案2：fallback 到 GitHub API 获取 Release body（有 rate limit）
+    try:
         data = _fetch_json_via_curl(_RELEASE_API_URL, timeout=10)
         if data and isinstance(data, dict):
             body = data.get("body", "")
