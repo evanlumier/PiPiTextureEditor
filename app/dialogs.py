@@ -129,6 +129,7 @@ class CropCanvas(QLabel):
         self._margin_bottom: int = 0
         self._margin_left: int = 0
         self._margin_right: int = 0
+        self._margin_fix_size: bool = False
         self._feather_enabled: bool = False
         self._feather_px: int = 10
         self._margin_preview_pixmap: Optional[QPixmap] = None  # 方案B：实时计算的预览图
@@ -172,12 +173,13 @@ class CropCanvas(QLabel):
             self.setCursor(Qt.ArrowCursor)
         self.update()
 
-    def set_margin_preview(self, top: int, bottom: int, left: int, right: int):
+    def set_margin_preview(self, top: int, bottom: int, left: int, right: int, fix_size: bool = False):
         """设置留白预览参数（用于画布上可视化显示）"""
         self._margin_top = top
         self._margin_bottom = bottom
         self._margin_left = left
         self._margin_right = right
+        self._margin_fix_size = fix_size
         self._rebuild_margin_preview()
         self.update()
 
@@ -198,6 +200,7 @@ class CropCanvas(QLabel):
 
         # 基于当前画布图片生成带留白的预览图
         img = self.pil_img.convert("RGBA")
+        pre_margin_w, pre_margin_h = img.width, img.height
         new_w = img.width + ml + mr
         new_h = img.height + mt + mb
         canvas = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
@@ -206,6 +209,10 @@ class CropCanvas(QLabel):
         # 如果开启了羽化，应用羽化效果
         if self._feather_enabled and self._feather_px > 0:
             canvas = self._apply_feather_preview(canvas, self._feather_px, mt, mb, ml, mr)
+
+        # 如果开启了尺寸固定，缩放回留白前的尺寸
+        if self._margin_fix_size:
+            canvas = canvas.resize((pre_margin_w, pre_margin_h), Image.LANCZOS)
 
         # 转为 QPixmap
         self._margin_preview_pixmap = pil_to_qpixmap(canvas)
@@ -1217,28 +1224,43 @@ class CropDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("图像调整")
         self.resize(1100, 720)
-        self.setStyleSheet("""
-            QDialog { background-color: #1e1e2e; color: #cdd6f4; }
-            QLabel { color: #a6adc8; font-size: 12px; }
-            QPushButton {
+        # 生成对勾图标临时文件
+        import tempfile, base64 as _b64
+        _chk_mark_b64 = (
+            b"iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAYAAABWdVznAAAAQ0lEQVR4nNVO"
+            b"OQoAMAgz/v/P6aLggcWOzRLFHIr8CZL0WbdiGus2GQCaIQoiYOJkqNXO"
+            b"UZwM8TA1tZdqWt1H3BqecQATASf9lQz7/wAAAABJRU5ErkJggg=="
+        )
+        _tmp_chk = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        _tmp_chk.write(_b64.b64decode(_chk_mark_b64))
+        _tmp_chk.close()
+        _chk_path = _tmp_chk.name.replace("\\", "/")
+        _style = f"""
+            QDialog {{ background-color: #1e1e2e; color: #cdd6f4; }}
+            QLabel {{ color: #a6adc8; font-size: 12px; }}
+            QPushButton {{
                 background-color: #313244; color: #cdd6f4;
                 border: 1px solid #45475a; border-radius: 7px;
                 padding: 6px 18px; font-size: 13px;
-            }
-            QPushButton:hover { background-color: #45475a; border-color: #89b4fa; }
-            QPushButton:pressed { background-color: #89b4fa; color: #1e1e2e; }
-            QSpinBox {
+            }}
+            QPushButton:hover {{ background-color: #45475a; border-color: #89b4fa; }}
+            QPushButton:pressed {{ background-color: #89b4fa; color: #1e1e2e; }}
+            QSpinBox {{
                 background: #313244; color: #cdd6f4; border: 1px solid #45475a;
                 border-radius: 5px; padding: 3px 8px; font-size: 12px;
-            }
-            QSpinBox:focus { border-color: #89b4fa; }
-            QCheckBox { color: #cdd6f4; font-size: 12px; }
-            QCheckBox::indicator {
+            }}
+            QSpinBox:focus {{ border-color: #89b4fa; }}
+            QCheckBox {{ color: #cdd6f4; font-size: 12px; }}
+            QCheckBox::indicator {{
                 width: 16px; height: 16px; border-radius: 3px;
                 border: 1px solid #45475a; background: #313244;
-            }
-            QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
-        """)
+            }}
+            QCheckBox::indicator:checked {{
+                background: #89b4fa; border-color: #89b4fa;
+                image: url("{_chk_path}");
+            }}
+        """
+        self.setStyleSheet(_style)
 
         self.result_img: Optional[Image.Image] = None
 
@@ -1331,9 +1353,19 @@ class CropDialog(QDialog):
         right_layout.addWidget(sep1)
 
         # ─── 边缘留白区域 ───
+        margin_title_row = QHBoxLayout()
+        margin_title_row.setSpacing(8)
         margin_title = QLabel("边缘留白")
         margin_title.setStyleSheet("color: #cdd6f4; font-size: 13px; font-weight: bold;")
-        right_layout.addWidget(margin_title)
+        margin_title_row.addWidget(margin_title)
+        self._chk_fix_size = QCheckBox("尺寸固定")
+        self._chk_fix_size.setChecked(True)
+        self._chk_fix_size.setToolTip("勾选后，留白不会改变输出图片尺寸（自动缩放回原始尺寸）")
+        self._chk_fix_size.setStyleSheet("color: #a6e3a1; font-size: 11px; font-weight: bold; margin-left: 12px;")
+        self._chk_fix_size.toggled.connect(self._on_fix_size_toggled)
+        margin_title_row.addWidget(self._chk_fix_size)
+        margin_title_row.addStretch()
+        right_layout.addLayout(margin_title_row)
 
         margin_grid = QGridLayout()
         margin_grid.setSpacing(6)
@@ -1586,7 +1618,16 @@ class CropDialog(QDialog):
             self._spin_bottom.value(),
             self._spin_left.value(),
             self._spin_right.value(),
+            fix_size=self._chk_fix_size.isChecked(),
         )
+
+    def _on_fix_size_toggled(self, checked: bool):
+        """尺寸固定toggle变化时更新画布预览 + 更新文字样式"""
+        if checked:
+            self._chk_fix_size.setStyleSheet("color: #a6e3a1; font-size: 11px; font-weight: bold; margin-left: 12px;")
+        else:
+            self._chk_fix_size.setStyleSheet("color: #a6adc8; font-size: 11px; margin-left: 12px;")
+        self._on_margin_changed()
 
     def _on_feather_changed(self):
         """羽化参数变化时实时更新画布预览"""
@@ -1626,6 +1667,9 @@ class CropDialog(QDialog):
         ml = self._spin_left.value()
         mr = self._spin_right.value()
 
+        # 记录留白前的图片尺寸（用于尺寸固定）
+        pre_margin_w, pre_margin_h = img.width, img.height
+
         if mt > 0 or mb > 0 or ml > 0 or mr > 0:
             new_w = img.width + ml + mr
             new_h = img.height + mt + mb
@@ -1637,6 +1681,11 @@ class CropDialog(QDialog):
         if self._chk_feather.isChecked() and (mt > 0 or mb > 0 or ml > 0 or mr > 0):
             feather_px = self._spin_feather.value()
             img = self._apply_feather(img, feather_px, mt, mb, ml, mr)
+
+        # Step 4: 尺寸固定 — 如果勾选，将图片缩放回留白前的尺寸
+        if self._chk_fix_size.isChecked() and (mt > 0 or mb > 0 or ml > 0 or mr > 0):
+            if img.width != pre_margin_w or img.height != pre_margin_h:
+                img = img.resize((pre_margin_w, pre_margin_h), Image.LANCZOS)
 
         self.result_img = img
         self.accept()

@@ -405,10 +405,25 @@ class VectorMapCanvas(QWidget):
         nm[:, :, 2] = 1.0  # z = 1
         return nm
     def set_ref(self, img: Optional[Image.Image]):
-        """由外部（DropRefWidget 回调）设置参考图。"""
+        """由外部（DropRefWidget 回调）设置参考图。
+        画布逻辑尺寸会根据参考图宽高比自适应调整（最大边 512），
+        确保绘制区域与参考图比例一致，避免拉伸。
+        """
         if img is None:
             self._ref_np = None
+            # 恢复默认正方形画布
+            self._resize_canvas(CANVAS_W, CANVAS_H)
         else:
+            # 根据参考图比例计算画布逻辑尺寸（最大边 512）
+            iw, ih = img.size
+            max_side = max(CANVAS_W, CANVAS_H)
+            if iw >= ih:
+                new_cw = max_side
+                new_ch = max(1, int(round(ih / iw * max_side)))
+            else:
+                new_ch = max_side
+                new_cw = max(1, int(round(iw / ih * max_side)))
+            self._resize_canvas(new_cw, new_ch)
             resized = img.convert("RGBA").resize(
                 (self._cw, self._ch), Image.LANCZOS
             )
@@ -416,6 +431,26 @@ class VectorMapCanvas(QWidget):
         self._flow_cache_dirty = True
         self._ref_calc_np = None  # 参考图换了，清除下采样缓存
         self.update()
+
+    def _resize_canvas(self, new_cw: int, new_ch: int):
+        """调整画布逻辑尺寸，重建 normal_map 和相关缓存。"""
+        if new_cw == self._cw and new_ch == self._ch:
+            return
+        self._cw = new_cw
+        self._ch = new_ch
+        # 重建 normal_map（清空绘制内容）
+        self.normal_map = self._make_flat_normal()
+        self._undo_stack.clear()
+        # 清除所有缓存
+        self._flow_cache_dirty = True
+        self._ref_calc_np = None
+        self._normal_vis_pix = None
+        self._normal_vis_dirty = True
+        self._grid_xs = None
+        self._grid_ys = None
+        self._grid_res = (0, 0)
+        self._flow_calc_size = (0, 0)
+        self._update_pix_rect()
 
     # ── 尺寸 / 缩放 ──────────────────────────────────────────────
     def resizeEvent(self, e):
@@ -1294,7 +1329,6 @@ class FlowMapTab(ExportDirMixin, QWidget):
         self.chk_hq_preview.setToolTip("开启：使用原图分辨率计算流动预览（效果准确但较慢）\n关闭：使用 256 分辨率计算（流畅但轻微模糊）")
         self.chk_hq_preview.setStyleSheet(
             "QCheckBox { color:#89b4fa; font-size:12px; font-weight:600; }"
-            "QCheckBox::indicator:checked { background-color:#89b4fa; border-color:#89b4fa; }"
         )
         self.chk_hq_preview.stateChanged.connect(self._on_hq_preview_toggled)
         preview_header.addStretch(1)
@@ -1402,8 +1436,37 @@ class FlowMapTab(ExportDirMixin, QWidget):
     # ── 回调 ──────────────────────────────────────────────────────────
     def _on_ref_drop_loaded(self, img: Optional[Image.Image]):
         """DropRefWidget 导入/清除参考图后的回调。"""
+        # 如果画布有绘制内容且新参考图会导致画布尺寸变化，提示用户
+        if self.canvas._undo_stack:
+            # 计算新参考图是否会改变画布尺寸
+            will_resize = False
+            if img is None:
+                will_resize = (self.canvas._cw != CANVAS_W or self.canvas._ch != CANVAS_H)
+            else:
+                iw, ih = img.size
+                max_side = max(CANVAS_W, CANVAS_H)
+                if iw >= ih:
+                    new_cw = max_side
+                    new_ch = max(1, int(round(ih / iw * max_side)))
+                else:
+                    new_ch = max_side
+                    new_cw = max(1, int(round(iw / ih * max_side)))
+                will_resize = (new_cw != self.canvas._cw or new_ch != self.canvas._ch)
+
+            if will_resize:
+                ret = QMessageBox.warning(
+                    self, "绘制内容将被清除",
+                    "新参考图的比例与当前不同，画布尺寸需要调整，\n这将清除所有已绘制的法线内容。\n\n是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ret != QMessageBox.Yes:
+                    return
+
         # 同步到画布（绘制区底图）
         self.canvas.set_ref(img)
+        # 画布尺寸可能因参考图比例变化，刷新信息显示
+        self._update_info()
         # drop_ref 本身已经显示缩略图，无需额外操作
 
     def _on_normal_updated(self, nm: np.ndarray):
@@ -1615,8 +1678,9 @@ class FlowMapTab(ExportDirMixin, QWidget):
         self._update_info()
 
     def _update_info(self):
+        canvas_sz = f"{self.canvas._cw}×{self.canvas._ch}"
         sz = (f"{self._target_size[0]}×{self._target_size[1]}"
-              if self._target_size else "512×512（默认）")
+              if self._target_size else f"{canvas_sz}（默认）")
         mode_txt = self.combo_normal_mode.currentText()
         self.info_label.setText(f"尺寸：{sz}\n模式：{mode_txt}")
 

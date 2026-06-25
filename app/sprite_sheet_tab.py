@@ -815,7 +815,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             QCheckBox::indicator:checked {
                 background-color: #89b4fa;
                 border-color: #89b4fa;
-                image: none;
+                image: url("__CHK_MARK__");
             }
             QCheckBox::indicator:hover {
                 border-color: #89b4fa;
@@ -834,9 +834,20 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         _tmp_dn = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         _tmp_dn.write(_b64.b64decode(_dn_arrow_b64))
         _tmp_dn.close()
+        # 白色对勾图标（用于 QCheckBox checked 状态）
+        _chk_mark_b64 = (
+            b"iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAYAAABWdVznAAAAQ0lEQVR4nNVO"
+            b"OQoAMAgz/v/P6aLggcWOzRLFHIr8CZL0WbdiGus2GQCaIQoiYOJkqNXO"
+            b"UZwM8TA1tZdqWt1H3BqecQATASf9lQz7/wAAAABJRU5ErkJggg=="
+        )
+        _tmp_chk = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        _tmp_chk.write(_b64.b64decode(_chk_mark_b64))
+        _tmp_chk.close()
         import atexit as _atexit
         _atexit.register(lambda p=_tmp_dn.name: os.path.exists(p) and os.remove(p))
+        _atexit.register(lambda p=_tmp_chk.name: os.path.exists(p) and os.remove(p))
         _sprite_style = _sprite_style.replace("__COMBO_DN_ARROW__", _tmp_dn.name.replace("\\", "/"))
+        _sprite_style = _sprite_style.replace("__CHK_MARK__", _tmp_chk.name.replace("\\", "/"))
         self.setStyleSheet(_sprite_style)
 
         # Left

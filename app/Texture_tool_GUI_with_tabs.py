@@ -307,6 +307,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
             QCheckBox::indicator:checked {
                 background-color: #89b4fa;
                 border-color: #89b4fa;
+                image: url("__CHK_MARK__");
             }
             QCheckBox::indicator:hover {
                 border-color: #89b4fa;
@@ -432,9 +433,20 @@ class MainWindow(ExportDirMixin, QMainWindow):
         _tmp_dn = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         _tmp_dn.write(_b64.b64decode(_dn_arrow_b64))
         _tmp_dn.close()
+        # 白色对勾图标（用于 QCheckBox checked 状态）
+        _chk_mark_b64 = (
+            b"iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAYAAABWdVznAAAAQ0lEQVR4nNVO"
+            b"OQoAMAgz/v/P6aLggcWOzRLFHIr8CZL0WbdiGus2GQCaIQoiYOJkqNXO"
+            b"UZwM8TA1tZdqWt1H3BqecQATASf9lQz7/wAAAABJRU5ErkJggg=="
+        )
+        _tmp_chk = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        _tmp_chk.write(_b64.b64decode(_chk_mark_b64))
+        _tmp_chk.close()
         import atexit as _atexit
         _atexit.register(lambda p=_tmp_dn.name: os.path.exists(p) and os.remove(p))
+        _atexit.register(lambda p=_tmp_chk.name: os.path.exists(p) and os.remove(p))
         _style = _style.replace("__COMBO_DN_ARROW__", _tmp_dn.name.replace("\\", "/"))
+        _style = _style.replace("__CHK_MARK__", _tmp_chk.name.replace("\\", "/"))
         self.setStyleSheet(_style)
 
         self.src_path: Optional[str] = None
@@ -453,6 +465,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
         self.has_unmult: bool = False
         self.custom_bg_color: Optional[Tuple[int, int, int]] = None
         self.target_size: Optional[Tuple[int, int]] = None
+        self._pre_crop_color: Optional[Image.Image] = None  # 图像调整前的原始图（用于重置）
 
         self.working_img: Optional[Image.Image] = None
         self._preview_thumb: Optional[Image.Image] = None  # 预览用缩略图
@@ -1599,6 +1612,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
             self._ue4_source_info_per_tab.pop(0, None)
 
             self.source_color = img
+            self._pre_crop_color = img.copy()  # 保留图像调整前的原始图（用于重置）
             self.master_color = img.copy()
 
             self.is_bw = False
@@ -1762,10 +1776,11 @@ class MainWindow(ExportDirMixin, QMainWindow):
             self.rebuild_working()
 
     def reset_crop(self):
-        # 重置图像调整：回到基准图（图像调整确认后的状态）
-        if self.source_color is None:
+        # 重置图像调整：回到图像调整前的原始状态
+        if self._pre_crop_color is None:
             return
-        self.master_color = self.source_color.copy()
+        self.source_color = self._pre_crop_color.copy()
+        self.master_color = self._pre_crop_color.copy()
         self.rebuild_working()
 
     # ---------------- BW ----------------
@@ -2051,12 +2066,6 @@ class MainWindow(ExportDirMixin, QMainWindow):
             result = np.dstack([rgb, new_alpha])
             base = Image.fromarray(result, "RGBA")
 
-        if self.custom_bg_color is not None:
-            bg = Image.new("RGBA", base.size, (*self.custom_bg_color, 255))
-            bg.paste(base, mask=base.split()[3])
-            bg.putalpha(255)
-            base = bg
-
         if self.target_size is not None:
             w, h = self.target_size
             base = base.resize((int(w), int(h)), resample=Image.LANCZOS)
@@ -2095,7 +2104,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
 
     @property
     def preview_img(self) -> Optional[Image.Image]:
-        """懒加载全尺寸预览图（带亮度/对比度），仅在导出/遮罩等需要时才计算"""
+        """懒加载全尺寸预览图（带亮度/对比度+底色），仅在导出/遮罩等需要时才计算"""
         if self.working_img is None:
             return None
         if self._preview_dirty or self._preview_full_cache is None:
@@ -2104,6 +2113,12 @@ class MainWindow(ExportDirMixin, QMainWindow):
             full = self.working_img.copy()
             full = ImageEnhance.Brightness(full).enhance(b)
             full = ImageEnhance.Contrast(full).enhance(c)
+            # 底色合成放在亮度/对比度之后，确保底色不受调整影响
+            if self.custom_bg_color is not None:
+                bg = Image.new("RGBA", full.size, (*self.custom_bg_color, 255))
+                bg.paste(full, mask=full.split()[3])
+                bg.putalpha(255)
+                full = bg
             self._preview_full_cache = full
             self._preview_dirty = False
         return self._preview_full_cache
@@ -2124,6 +2139,12 @@ class MainWindow(ExportDirMixin, QMainWindow):
         img = thumb.copy()
         img = ImageEnhance.Brightness(img).enhance(b)
         img = ImageEnhance.Contrast(img).enhance(c)
+        # 底色合成放在亮度/对比度之后，确保底色不受调整影响
+        if self.custom_bg_color is not None:
+            bg = Image.new("RGBA", img.size, (*self.custom_bg_color, 255))
+            bg.paste(img, mask=img.split()[3])
+            bg.putalpha(255)
+            img = bg
 
         pix = pil_to_qpixmap(img)
         self.preview_label.setPixmap(pix)
