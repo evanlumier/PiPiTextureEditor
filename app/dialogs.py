@@ -16,6 +16,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
+from theme import T
+
 from PySide6.QtCore import Qt, QRect, QPoint, QPointF, Signal
 from PySide6.QtGui import (
     QPixmap,
@@ -77,7 +79,7 @@ class CropCanvas(QLabel):
     def __init__(self, pil_img: Image.Image):
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#2a2a38;border-radius:10px;")
+        self.setStyleSheet(f"background:{T.bg_overlay};border-radius:10px;")
         self.setMouseTracking(True)
 
         self._original_img = pil_img.convert("RGBA")  # 保留原图用于重新旋转
@@ -1135,7 +1137,7 @@ class MaskThresholdDialog(QDialog):
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumSize(640, 440)
-        self.preview_label.setStyleSheet("background-color: #11111b; border: 1px solid #45475a;")
+        self.preview_label.setStyleSheet(f"background-color: {T.bg_surface}; border: 1px solid {T.border};")
 
         # 阈值滑块行
         thresh_row = QHBoxLayout()
@@ -1308,7 +1310,7 @@ class CropDialog(QDialog):
         rotate_row_layout.setSpacing(6)
 
         rotate_label = QLabel("旋转角度：")
-        rotate_label.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        rotate_label.setStyleSheet(f"color: {T.text_secondary}; font-size: 12px;")
 
         self._rotate_spin = QDoubleSpinBox()
         self._rotate_spin.setRange(-180.0, 180.0)

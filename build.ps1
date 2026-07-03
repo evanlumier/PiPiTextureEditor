@@ -1,8 +1,9 @@
 ﻿# build.ps1 - 皮皮贴图修改器 一键打包脚本（强化版）
 # 用法：
-#   .\build.ps1                       # 默认自动小版本+1（patch+1）
-#   .\build.ps1 -BumpPatch:$false     # 不递增版本号，沿用 version.py 里的当前值
-#   .\build.ps1 -Version "v0.9.0"     # 手动指定版本号
+#   .\build.ps1                              # 默认自动小版本+1（patch+1），交互式输入 notes
+#   .\build.ps1 -BumpPatch:$false            # 不递增版本号，沿用 version.py 里的当前值
+#   .\build.ps1 -Version "v0.9.0"            # 手动指定版本号
+#   .\build.ps1 -NotesFile release_notes.txt # 从文件读取 release notes（跳过交互，用于自动化）
 #
 # ★★★ 设计原则 ★★★
 # 1. 任何关键步骤失败 → 立即 exit 1，绝不允许带病推进
@@ -17,7 +18,8 @@
 [CmdletBinding()]
 param(
     [switch]$BumpPatch = $true,
-    [string]$Version = ""
+    [string]$Version = "",
+    [string]$NotesFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,32 +99,84 @@ $ZipName    = "PPTextureEditor_$VersionTag.zip"
 # ────────────────────────────────────────────────────────────────
 Write-Step "[2/8] 收集本次版本更新内容（Release Notes）"
 
-Write-Host ""
-Write-Host "请输入本次版本（$VersionTag）的更新内容。" -ForegroundColor Yellow
-Write-Host "支持多行，输入完成后单独一行键入 END 回车即可结束。" -ForegroundColor Yellow
-Write-Host "（直接键入 END 表示放弃本次构建）" -ForegroundColor DarkYellow
-Write-Host "------------------------------------------------" -ForegroundColor DarkGray
+# 先收集用户提供的内容行（文件或交互），版本号头与联系尾“智能去重”后在外部拼接
+$rawUserLines = New-Object System.Collections.Generic.List[string]
+
+if ($NotesFile -ne "") {
+    # ── 非交互模式：从文件读取 notes ──
+    $notesFilePath = if ([System.IO.Path]::IsPathRooted($NotesFile)) {
+        $NotesFile
+    } else {
+        Join-Path $ProjectRoot $NotesFile
+    }
+    if (-not (Test-Path $notesFilePath)) {
+        Fail "指定的 -NotesFile 不存在: $notesFilePath"
+    }
+    Info "从文件读取 release notes: $notesFilePath"
+
+    # 用 .NET 强制按 UTF-8 读取，避免 PowerShell 5.1 默认按 GBK 误读中文
+    $rawNotes = [System.IO.File]::ReadAllText($notesFilePath, [System.Text.Encoding]::UTF8)
+    # 统一换行符，去掉尾部空行
+    $rawNotes = $rawNotes -replace "`r`n", "`n" -replace "`r", "`n"
+    $userLines = $rawNotes.TrimEnd("`n").Split("`n")
+
+    $userLineCount = 0
+    foreach ($ln in $userLines) {
+        # 跳过完全空白的开头行；中间的空行保留（用于分段）
+        if ($userLineCount -eq 0 -and [string]::IsNullOrWhiteSpace($ln)) { continue }
+        $rawUserLines.Add($ln) | Out-Null
+        $userLineCount++
+    }
+    if ($userLineCount -eq 0) {
+        Fail "-NotesFile 内容为空，已放弃本次构建。"
+    }
+} else {
+    # ── 交互模式：Read-Host 多行输入 ──
+    Write-Host ""
+    Write-Host "请输入本次版本（$VersionTag）的更新内容。" -ForegroundColor Yellow
+    Write-Host "支持多行，输入完成后单独一行键入 END 回车即可结束。" -ForegroundColor Yellow
+    Write-Host "（直接键入 END 表示放弃本次构建）" -ForegroundColor DarkYellow
+    Write-Host "------------------------------------------------" -ForegroundColor DarkGray
+
+    $userLineCount = 0
+    while ($true) {
+        $line = Read-Host
+        if ($line -ceq "END") { break }
+        $rawUserLines.Add($line) | Out-Null
+        $userLineCount++
+    }
+
+    if ($userLineCount -eq 0) {
+        Fail "未输入任何更新内容，已放弃本次构建。"
+    }
+}
+
+# ── 智能去重：如果用户内容已包含 v版本号头 / 联系尾，就不再重复叠加 ──
+$hasVersionHeader = ($rawUserLines.Count -gt 0) -and ($rawUserLines[0].Trim() -eq $VersionTag)
+$contactLine = "有任何问题，请联系eyvanlu"
+$hasContactFooter = $false
+for ($i = $rawUserLines.Count - 1; $i -ge 0; $i--) {
+    $l = $rawUserLines[$i].Trim()
+    if ($l -eq "") { continue }
+    if ($l -eq $contactLine) { $hasContactFooter = $true }
+    break
+}
 
 $lines = New-Object System.Collections.Generic.List[string]
-# 第一行先放版本号
-$lines.Add($VersionTag) | Out-Null
-$lines.Add("") | Out-Null
-
-$userLineCount = 0
-while ($true) {
-    $line = Read-Host
-    if ($line -ceq "END") { break }
-    $lines.Add($line) | Out-Null
-    $userLineCount++
+if (-not $hasVersionHeader) {
+    $lines.Add($VersionTag) | Out-Null
+    $lines.Add("") | Out-Null
 }
-
-if ($userLineCount -eq 0) {
-    Fail "未输入任何更新内容，已放弃本次构建。"
+foreach ($ln in $rawUserLines) {
+    $lines.Add($ln) | Out-Null
 }
-
-# 末尾加联系信息
-$lines.Add("") | Out-Null
-$lines.Add("有任何问题，请联系eyvanlu") | Out-Null
+if (-not $hasContactFooter) {
+    # 如果结尾不是空行，先补一个空行作为分隔
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim() -ne "") {
+        $lines.Add("") | Out-Null
+    }
+    $lines.Add($contactLine) | Out-Null
+}
 
 $notesContent = ($lines -join "`r`n")
 $notesPath = Join-Path $ProjectRoot "release_notes.txt"
@@ -172,7 +226,23 @@ if (Test-Path $oldZip) {
 # ────────────────────────────────────────────────────────────────
 Write-Step "[4/8] PyInstaller 打包 exe"
 
-pyinstaller "皮皮贴图修改器.spec" --noconfirm
+# 从注册表动态解析 Python 真实可执行文件（PEP 514 规范），不依赖 PATH；
+# 避免 WindowsApps stub（C:\Users\...\WindowsApps\python.exe）在脚本调用时报“拒绝访问”。
+$pyExe = $null
+foreach ($regBase in @('HKLM:\Software\Python', 'HKCU:\Software\Python')) {
+    if (-not (Test-Path $regBase)) { continue }
+    $installPaths = Get-ChildItem $regBase -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -eq 'InstallPath' }
+    foreach ($ip in $installPaths) {
+        $exe = (Get-ItemProperty $ip.PSPath -ErrorAction SilentlyContinue).ExecutablePath
+        if ($exe -and (Test-Path $exe)) { $pyExe = $exe; break }
+    }
+    if ($pyExe) { break }
+}
+if (-not $pyExe) { Fail "未在注册表中找到可用的 Python 安装（HKLM/HKCU\Software\Python\...\InstallPath::ExecutablePath）。" }
+Info "使用 Python: $pyExe"
+
+& $pyExe -m PyInstaller "皮皮贴图修改器.spec" --noconfirm
 if ($LASTEXITCODE -ne 0) { Fail "PyInstaller 打包失败（exit code $LASTEXITCODE）。" }
 Ok "PyInstaller 打包完成。"
 

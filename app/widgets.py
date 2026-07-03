@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from tab_transfer import RIGHT_CLICK_THRESHOLD
+from theme import T
 
 # ========= 兼容：不同 PySide6 版本 QStylePainter 所在模块不同 =========
 try:
@@ -50,8 +51,8 @@ class DropLabel(QLabel):
         self.setCursor(Qt.PointingHandCursor)
         self.setText("拖拽图片到这里\n或点击此区域导入")
         self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
+            f"border:2px dashed {T.border};border-radius:10px;padding:20px;"
+            f"background:transparent;color:{T.text_tertiary};font-size:13px;"
         )
 
     def mousePressEvent(self, event):
@@ -72,22 +73,22 @@ class DropLabel(QLabel):
                 if ext in ('.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'):
                     event.acceptProposedAction()
                     self.setStyleSheet(
-                        "border:2px dashed #89b4fa;border-radius:10px;padding:20px;"
-                        "background:rgba(137,180,250,0.08);color:#89b4fa;font-size:13px;"
+                        f"border:2px dashed {T.accent};border-radius:10px;padding:20px;"
+                        f"background:rgba(137,180,250,0.08);color:{T.accent};font-size:13px;"
                     )
                     return
         event.ignore()
 
     def dragLeaveEvent(self, event):
         self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
+            f"border:2px dashed {T.border};border-radius:10px;padding:20px;"
+            f"background:transparent;color:{T.text_tertiary};font-size:13px;"
         )
 
     def dropEvent(self, event):
         self.setStyleSheet(
-            "border:2px dashed #45475a;border-radius:10px;padding:20px;"
-            "background:transparent;color:#6c7086;font-size:13px;"
+            f"border:2px dashed {T.border};border-radius:10px;padding:20px;"
+            f"background:transparent;color:{T.text_tertiary};font-size:13px;"
         )
         urls = event.mimeData().urls()
         if not urls:

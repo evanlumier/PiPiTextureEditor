@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image
 
 from export_dir_mixin import ExportDirMixin
+from theme import T
 
 from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QRegularExpression, QTimer, QThread, Signal
 from PySide6.QtGui import (
@@ -425,7 +426,7 @@ class PreviewLabel(QWidget):
 
         if hint:
             self._hint_label = QLabel(hint)
-            self._hint_label.setStyleSheet("color:#45475a; font-size:9px;")
+            self._hint_label.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
             self._hint_label.setAlignment(Qt.AlignCenter)
             self._hint_label.setWordWrap(True)
             layout.addWidget(self._hint_label)
@@ -514,7 +515,7 @@ class GrowthCanvas(QWidget):
         # 回调：笔触结束时通知 Tab
         self.on_stroke_finished = None   # callable(points_canvas: list[tuple[int,int]], value: float)
 
-        self.setStyleSheet("background:#181825;")
+        self.setStyleSheet(f"background:{T.bg_surface};")
         self.setCursor(QCursor(Qt.CrossCursor))
 
         # 拖拽导入
@@ -961,14 +962,14 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
 
         adv_pv.addWidget(_section_title("首帧占位图", "#89b4fa"))
         _note1 = QLabel("⚠ 这是识别结果，不是原图")
-        _note1.setStyleSheet("color:#a6adc8; font-size:9px;")
+        _note1.setStyleSheet(f"color:{T.text_secondary}; font-size:9px;")
         adv_pv.addWidget(_note1)
         self.lbl_presence = PreviewLabel("（未生成）")
         adv_pv.addWidget(self.lbl_presence)
 
         adv_pv.addWidget(_section_title("末帧单调包络", "#cba6f7"))
         _note2 = QLabel("⚠ 这是识别结果，不是原图")
-        _note2.setStyleSheet("color:#a6adc8; font-size:9px;")
+        _note2.setStyleSheet(f"color:{T.text_secondary}; font-size:9px;")
         adv_pv.addWidget(_note2)
         self.lbl_envelope = PreviewLabel("（未生成）")
         adv_pv.addWidget(self.lbl_envelope)
@@ -1014,9 +1015,9 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
 
         canvas_header = QHBoxLayout()
         canvas_lbl = QLabel("生长画布")
-        canvas_lbl.setStyleSheet("color:#cdd6f4; font-size:12px; font-weight:700;")
+        canvas_lbl.setStyleSheet(f"color:{T.text_primary}; font-size:12px; font-weight:700;")
         self.lbl_canvas_hint = QLabel("Ctrl+滚轮 缩放 · 中键拖拽 · F 适配")
-        self.lbl_canvas_hint.setStyleSheet("color:#585b70; font-size:10px;")
+        self.lbl_canvas_hint.setStyleSheet(f"color:{T.text_disabled}; font-size:10px;")
         canvas_header.addWidget(canvas_lbl)
         canvas_header.addStretch()
         canvas_header.addWidget(self.lbl_canvas_hint)
@@ -1096,7 +1097,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
 
         # 清空路径
         self.btn_clear_seed = QPushButton("清空手绘路径")
-        self.btn_clear_seed.setStyleSheet("color:#f38ba8;")
+        self.btn_clear_seed.setStyleSheet(f"color:{T.error};")
         bg.addWidget(self.btn_clear_seed, 3, 0, 1, 3)
 
         # 橡皮擦按钮
@@ -1159,7 +1160,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         mode_layout.addWidget(self.btn_mode_single)
 
         self.lbl_mode_hint = QLabel("请先选择工作模式")
-        self.lbl_mode_hint.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_mode_hint.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_mode_hint.setAlignment(Qt.AlignCenter)
         mode_layout.addWidget(self.lbl_mode_hint)
 
@@ -1217,7 +1218,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         sig.addWidget(self._video_sample_widget)
 
         self.lbl_seq_import_info = QLabel("未导入")
-        self.lbl_seq_import_info.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_seq_import_info.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_seq_import_info.setWordWrap(True)
         sig.addWidget(self.lbl_seq_import_info)
 
@@ -1260,7 +1261,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         srg.addWidget(self.lbl_source_mode_warn)
 
         _hint_mode = QLabel("手动选择时强制使用指定方式，不受自动检测影响")
-        _hint_mode.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_mode.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_mode.setWordWrap(True)
         srg.addWidget(_hint_mode)
 
@@ -1278,14 +1279,14 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         blur_row.addWidget(self.dspin_blur)
         btn_reset_blur = QPushButton("重置")
         btn_reset_blur.setFixedWidth(40)
-        btn_reset_blur.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_blur.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_blur.setToolTip("恢复默认值 0.0")
         btn_reset_blur.clicked.connect(lambda: self.dspin_blur.setValue(0.0))
         blur_row.addWidget(btn_reset_blur)
         blur_row.addStretch()
         srg.addLayout(blur_row)
         _hint_blur = QLabel("调大可消除边缘锯齿，但会让主体边界变模糊。0 = 不处理")
-        _hint_blur.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_blur.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_blur.setWordWrap(True)
         srg.addWidget(_hint_blur)
 
@@ -1307,14 +1308,14 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         hit_row.addWidget(self.dspin_hit)
         btn_reset_hit = QPushButton("重置")
         btn_reset_hit.setFixedWidth(40)
-        btn_reset_hit.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_hit.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_hit.setToolTip("恢复默认值 0.20")
         btn_reset_hit.clicked.connect(lambda: self.dspin_hit.setValue(0.2))
         hit_row.addWidget(btn_reset_hit)
         hit_row.addStretch()
         srrg.addLayout(hit_row)
         _hint_hit = QLabel("调小=更容易识别到内容（可能误判背景）；调大=只识别明显内容")
-        _hint_hit.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_hit.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_hit.setWordWrap(True)
         srrg.addWidget(_hint_hit)
 
@@ -1331,14 +1332,14 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         mask_thresh_row.addWidget(self.dspin_mask_thresh)
         btn_reset_mask_thresh = QPushButton("重置")
         btn_reset_mask_thresh.setFixedWidth(40)
-        btn_reset_mask_thresh.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_mask_thresh.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_mask_thresh.setToolTip("恢复默认值 0.05")
         btn_reset_mask_thresh.clicked.connect(lambda: self.dspin_mask_thresh.setValue(0.05))
         mask_thresh_row.addWidget(btn_reset_mask_thresh)
         mask_thresh_row.addStretch()
         srrg.addLayout(mask_thresh_row)
         _hint_mask = QLabel("调大=只保留最明显的主体区域；调小=保留更多边缘细节")
-        _hint_mask.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_mask.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_mask.setWordWrap(True)
         srrg.addWidget(_hint_mask)
 
@@ -1354,7 +1355,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self.chk_invert.setToolTip("勾选后：原本先出现的区域变为白色（后出现），反之亦然")
         sgg.addWidget(self.chk_invert)
         _hint_invert = QLabel("默认：先出现=黑，后出现=白。勾选后颠倒")
-        _hint_invert.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_invert.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_invert.setWordWrap(True)
         sgg.addWidget(_hint_invert)
 
@@ -1374,7 +1375,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         sgg.addWidget(self.btn_cancel_seq)
 
         self.lbl_seq_status = QLabel("尚未生成")
-        self.lbl_seq_status.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_seq_status.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_seq_status.setWordWrap(True)
         sgg.addWidget(self.lbl_seq_status)
 
@@ -1407,7 +1408,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         siig.addWidget(self.btn_import_single)
 
         self.lbl_single_import_info = QLabel("未导入")
-        self.lbl_single_import_info.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_single_import_info.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_single_import_info.setWordWrap(True)
         siig.addWidget(self.lbl_single_import_info)
 
@@ -1424,7 +1425,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         )
         smg.addWidget(self.btn_mask_from_alpha)
         _hint_alpha = QLabel("适合有透明通道（Alpha）的贴图")
-        _hint_alpha.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_alpha.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         smg.addWidget(_hint_alpha)
 
         smg.addWidget(self._hline())
@@ -1437,7 +1438,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self.lbl_thresh_val = QLabel("128")
         self.lbl_thresh_val.setFixedWidth(36)
         self.lbl_thresh_val.setAlignment(Qt.AlignCenter)
-        self.lbl_thresh_val.setStyleSheet("color:#cdd6f4; font-size:11px;")
+        self.lbl_thresh_val.setStyleSheet(f"color:{T.text_primary}; font-size:11px;")
         # 保留 spin_thresh 作为内部数据接口（隐藏），与 slider 同步
         self.spin_thresh = QSpinBox()
         self.spin_thresh.setRange(0, 255)
@@ -1448,7 +1449,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         thresh_row.addWidget(self.lbl_thresh_val)
         smg.addLayout(thresh_row)
         _hint_thresh = QLabel("亮度高于此值的区域视为主体。调小=保留更多区域")
-        _hint_thresh.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_thresh.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_thresh.setWordWrap(True)
         smg.addWidget(_hint_thresh)
 
@@ -1459,7 +1460,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         smg.addWidget(self.btn_mask_from_lum)
 
         self.btn_clear_mask = QPushButton("清除主体范围")
-        self.btn_clear_mask.setStyleSheet("color:#f38ba8; font-size:10px;")
+        self.btn_clear_mask.setStyleSheet(f"color:{T.error}; font-size:10px;")
         smg.addWidget(self.btn_clear_mask)
 
         single_ctrl_layout.addWidget(single_mask_group)
@@ -1480,7 +1481,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         radius_row.addStretch()
         ppg.addLayout(radius_row)
         _hint_radius = QLabel("调大=路径影响更远的区域；调小=只影响路径附近")
-        _hint_radius.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_radius.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_radius.setWordWrap(True)
         ppg.addWidget(_hint_radius)
 
@@ -1498,7 +1499,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         power_row.addStretch()
         ppg.addLayout(power_row)
         _hint_power = QLabel("调大=路径边缘过渡更硬，影响范围更集中；调小=过渡更柔和")
-        _hint_power.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_power.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_power.setWordWrap(True)
         ppg.addWidget(_hint_power)
 
@@ -1514,7 +1515,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         smooth_row.addStretch()
         ppg.addLayout(smooth_row)
         _hint_smooth = QLabel("对结果做模糊平滑，消除锯齿感。0 = 不平滑")
-        _hint_smooth.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_smooth.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_smooth.setWordWrap(True)
         ppg.addWidget(_hint_smooth)
 
@@ -1525,7 +1526,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self.chk_fallback.setChecked(True)
         ppg.addWidget(self.chk_fallback)
         _hint_fallback = QLabel("勾选后，扩散范围内没有路径的区域会用最近路径的值填充")
-        _hint_fallback.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_fallback.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_fallback.setWordWrap(True)
         ppg.addWidget(_hint_fallback)
 
@@ -1538,7 +1539,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         ppg.addWidget(self.btn_generate_seed)
 
         self.lbl_prop_status = QLabel("尚未生成")
-        self.lbl_prop_status.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_prop_status.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_prop_status.setWordWrap(True)
         ppg.addWidget(self.lbl_prop_status)
 
@@ -1599,7 +1600,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self._noise_content_widget.setVisible(False)
 
         _hint_noise_top = QLabel("在生长路径灰度图上叠加噪波，打散边缘，增加细节变化")
-        _hint_noise_top.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_noise_top.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_noise_top.setWordWrap(True)
         _ncw_layout.addWidget(_hint_noise_top)
 
@@ -1623,7 +1624,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         )
         niw.addWidget(self.btn_import_noise)
         self.lbl_noise_import_info = QLabel("未导入")
-        self.lbl_noise_import_info.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_noise_import_info.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_noise_import_info.setWordWrap(True)
         niw.addWidget(self.lbl_noise_import_info)
         self._noise_import_widget.setVisible(False)
@@ -1642,13 +1643,13 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_strength_row.addWidget(self.dspin_noise_strength)
         btn_reset_noise_strength = QPushButton("重置")
         btn_reset_noise_strength.setFixedWidth(40)
-        btn_reset_noise_strength.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_noise_strength.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_noise_strength.clicked.connect(lambda: self.dspin_noise_strength.setValue(0.3))
         noise_strength_row.addWidget(btn_reset_noise_strength)
         noise_strength_row.addStretch()
         _ncw_layout.addLayout(noise_strength_row)
         _hint_ns = QLabel("调大=噪波影响更强，边缘打散更明显；调小=接近原始灰度图")
-        _hint_ns.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_ns.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_ns.setWordWrap(True)
         _ncw_layout.addWidget(_hint_ns)
 
@@ -1669,12 +1670,12 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_rotate_row.addWidget(self.lbl_noise_rotate_val)
         btn_reset_noise_rotate = QPushButton("重置")
         btn_reset_noise_rotate.setFixedWidth(40)
-        btn_reset_noise_rotate.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_noise_rotate.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_noise_rotate.clicked.connect(lambda: self.slider_noise_rotate.setValue(0))
         noise_rotate_row.addWidget(btn_reset_noise_rotate)
         _ncw_layout.addLayout(noise_rotate_row)
         _hint_nr = QLabel("旋转噪波贴图的采样角度（0°~360°）")
-        _hint_nr.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_nr.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _ncw_layout.addWidget(_hint_nr)
 
         _ncw_layout.addWidget(self._hline())
@@ -1688,7 +1689,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_scale_row.addWidget(self.dspin_noise_scale_x)
         btn_reset_nsx = QPushButton("重置")
         btn_reset_nsx.setFixedWidth(40)
-        btn_reset_nsx.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_nsx.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_nsx.clicked.connect(lambda: self.dspin_noise_scale_x.setText("4.0"))
         noise_scale_row.addWidget(btn_reset_nsx)
         noise_scale_row.addWidget(QLabel("  Y："))
@@ -1697,13 +1698,13 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_scale_row.addWidget(self.dspin_noise_scale_y)
         btn_reset_nsy = QPushButton("重置")
         btn_reset_nsy.setFixedWidth(40)
-        btn_reset_nsy.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_nsy.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_nsy.clicked.connect(lambda: self.dspin_noise_scale_y.setText("4.0"))
         noise_scale_row.addWidget(btn_reset_nsy)
         noise_scale_row.addStretch()
         _ncw_layout.addLayout(noise_scale_row)
         _hint_nsc = QLabel("调大=噪波纹理更粗；调小=噪波纹理更细密（X/Y 可分别控制水平和垂直方向）")
-        _hint_nsc.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_nsc.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _ncw_layout.addWidget(_hint_nsc)
 
         _ncw_layout.addWidget(self._hline())
@@ -1720,7 +1721,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_offset_row.addWidget(self.dspin_noise_offset_x)
         btn_reset_nx = QPushButton("重置")
         btn_reset_nx.setFixedWidth(40)
-        btn_reset_nx.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_nx.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_nx.clicked.connect(lambda: self.dspin_noise_offset_x.setValue(0.0))
         noise_offset_row.addWidget(btn_reset_nx)
         noise_offset_row.addStretch()
@@ -1736,13 +1737,13 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         noise_offset_y_row.addWidget(self.dspin_noise_offset_y)
         btn_reset_ny = QPushButton("重置")
         btn_reset_ny.setFixedWidth(40)
-        btn_reset_ny.setStyleSheet("color:#6c7086; font-size:9px; padding:2px;")
+        btn_reset_ny.setStyleSheet(f"color:{T.text_tertiary}; font-size:9px; padding:2px;")
         btn_reset_ny.clicked.connect(lambda: self.dspin_noise_offset_y.setValue(0.0))
         noise_offset_y_row.addWidget(btn_reset_ny)
         noise_offset_y_row.addStretch()
         _ncw_layout.addLayout(noise_offset_y_row)
         _hint_noff = QLabel("平移噪波采样位置，获得不同的噪波图案")
-        _hint_noff.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_noff.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _ncw_layout.addWidget(_hint_noff)
 
         _ncw_layout.addWidget(self._hline())
@@ -1763,7 +1764,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         _ncw_layout.addWidget(self.btn_apply_noise)
 
         self.lbl_noise_status = QLabel("未启用")
-        self.lbl_noise_status.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_noise_status.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_noise_status.setWordWrap(True)
         _ncw_layout.addWidget(self.lbl_noise_status)
 
@@ -1819,7 +1820,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         size_row.addWidget(self.export_size_h, 1)
         eg.addLayout(size_row)
         _hint_size = QLabel("选择\"原始尺寸\"则按原图分辨率导出，也可输入自定义数值")
-        _hint_size.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_size.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint_size.setWordWrap(True)
         eg.addWidget(_hint_size)
 
@@ -1842,7 +1843,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         eg.addWidget(self.btn_export_final)
 
         self.lbl_export_info = QLabel("尚未导出")
-        self.lbl_export_info.setStyleSheet("color:#6c7086; font-size:10px;")
+        self.lbl_export_info.setStyleSheet(f"color:{T.text_tertiary}; font-size:10px;")
         self.lbl_export_info.setWordWrap(True)
         eg.addWidget(self.lbl_export_info)
 
@@ -1901,7 +1902,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         layout.addLayout(title_row)
 
         _hint = QLabel("根据灰度图驱动显隐，判断生长路径顺序是否正确")
-        _hint.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         _hint.setWordWrap(True)
         layout.addWidget(_hint)
 
@@ -1922,7 +1923,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         layout.addLayout(prog_row)
 
         _hint_prog = QLabel("拖动查看不同时刻的显隐状态")
-        _hint_prog.setStyleSheet("color:#45475a; font-size:9px;")
+        _hint_prog.setStyleSheet(f"color:{T.text_hint}; font-size:9px;")
         layout.addWidget(_hint_prog)
 
         # 羽化控件（已隐藏，保留属性引用以兼容旧代码）

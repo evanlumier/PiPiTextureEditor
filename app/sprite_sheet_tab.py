@@ -7,6 +7,7 @@ from typing import List, Optional, Callable, Tuple, Set
 from PIL import Image
 
 from export_dir_mixin import ExportDirMixin
+from theme import T
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression, Signal
 from PySide6.QtGui import (
@@ -855,14 +856,14 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.drop_area = MultiDropLabel(self.add_paths)
 
         self.imported_title = QLabel("已导入文件：")
-        self.imported_title.setStyleSheet("font-weight:700; color:#89b4fa; padding:4px 2px;")
+        self.imported_title.setStyleSheet(f"font-weight:700; color:{T.accent}; padding:4px 2px;")
 
         self.list_widget = ReorderListWidget()
         self.list_widget.setMinimumWidth(230)
         self.list_widget.setFocusPolicy(Qt.StrongFocus)
         # 插入线蓝色（Qt 不同版本的 dropIndicator 选择器不同，这里双写）
         self.list_widget.setStyleSheet(
-            "background: #181825; border: 1px solid #383850; border-radius:8px;"
+            f"background: {T.bg_surface}; border: 1px solid {T.border}; border-radius:8px;"
             "color: #cdd6f4; outline: none; padding: 4px;"
         )
         self.list_widget.itemSelectionChanged.connect(self._on_list_selection_changed)
@@ -894,7 +895,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         center_col = QVBoxLayout()
 
         self.sheet_title = QLabel("精灵图预览")
-        self.sheet_title.setStyleSheet("font-weight:700; color:#89b4fa; padding:4px 2px;")
+        self.sheet_title.setStyleSheet(f"font-weight:700; color:{T.accent}; padding:4px 2px;")
 
         self.sheet_label = SheetPreviewLabel(
             self._reorder_by_cell_drag_multi,
@@ -908,12 +909,12 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
 
 
         self.gif_title = QLabel("GIF预览")
-        self.gif_title.setStyleSheet("font-weight:700; color:#89b4fa; padding:4px 2px;")
+        self.gif_title.setStyleSheet(f"font-weight:700; color:{T.accent}; padding:4px 2px;")
 
         self.gif_label = QLabel("")
         self.gif_label.setAlignment(Qt.AlignCenter)
         self.gif_label.setMinimumSize(520, 240)
-        self.gif_label.setStyleSheet("background: #181825; border: 1px solid #383850; border-radius:8px;")
+        self.gif_label.setStyleSheet(f"background: {T.bg_surface}; border: 1px solid {T.border}; border-radius:8px;")
 
         self.btn_refresh_gif = QPushButton("更新GIF预览")
         self.btn_refresh_gif.clicked.connect(self._update_gif_preview)
@@ -1082,7 +1083,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             hist_row.addWidget(btn)
 
         self.name_preview = QLabel("预览：-")
-        self.name_preview.setStyleSheet("color:#a6e3a1; font-weight:700; padding:2px 0;")
+        self.name_preview.setStyleSheet(f"color:{T.success}; font-weight:700; padding:2px 0;")
 
         self.btn_apply_name = QPushButton("应用命名")
         self.btn_apply_name.clicked.connect(self._apply_naming)

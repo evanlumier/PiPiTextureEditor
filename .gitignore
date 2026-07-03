@@ -9,3 +9,12 @@ dist/
 *.b64
 _old_version_backup/
 _update_in_progress.lock
+
+# ── UI 参考稿（本地保留，不提交仓库、不进打包）────────────
+fluent_preview.py
+PyHuskarUI/
+
+# ── 临时/调试文件 ────────────────────────────────────────
+_test_*.py
+_debug_*.py
+_test_*.qml

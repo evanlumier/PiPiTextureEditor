@@ -22,6 +22,7 @@ import cv2
 from typing import Optional, Tuple
 
 from export_dir_mixin import ExportDirMixin
+from theme import T
 
 from PIL import Image
 
@@ -101,7 +102,7 @@ def make_falloff_mask(size: int, hardness: float) -> np.ndarray:
         self._cached_pix: Optional[QPixmap] = None
         self._cached_size = (0, 0)
         self.setStyleSheet(
-            "background:#0d0d1a; border:1px solid #313244; border-radius:8px;"
+            f"background:{T.bg_surface}; border:1px solid {T.border_subtle}; border-radius:8px;"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -165,7 +166,7 @@ class DropRefWidget(QWidget):
         self.setAcceptDrops(True)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self.setStyleSheet(
-            "background:#0d0d1a; border:2px dashed #585b70; border-radius:8px;"
+            f"background:{T.bg_surface}; border:2px dashed {T.text_disabled}; border-radius:8px;"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumHeight(80)
@@ -175,7 +176,7 @@ class DropRefWidget(QWidget):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
             self.setStyleSheet(
-                "background:#1a1a2e; border:2px dashed #89b4fa; border-radius:8px;"
+                f"background:{T.bg_base}; border:2px dashed {T.accent}; border-radius:8px;"
             )
 
     def dragLeaveEvent(self, e):
@@ -242,11 +243,11 @@ class DropRefWidget(QWidget):
     def _reset_style(self):
         if self._src_img is None:
             self.setStyleSheet(
-                "background:#0d0d1a; border:2px dashed #585b70; border-radius:8px;"
+                f"background:{T.bg_surface}; border:2px dashed {T.text_disabled}; border-radius:8px;"
             )
         else:
             self.setStyleSheet(
-                "background:#0d0d1a; border:1px solid #313244; border-radius:8px;"
+                f"background:{T.bg_surface}; border:1px solid {T.border_subtle}; border-radius:8px;"
             )
 
     # ── 绘制 ──────────────────────────────────────────────────────────
@@ -304,7 +305,7 @@ class VectorMapCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background:#0d0d1a; border-radius:10px;")
+        self.setStyleSheet(f"background:{T.bg_surface}; border-radius:10px;")
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CrossCursor))
         self.setAcceptDrops(True)
@@ -353,6 +354,7 @@ class VectorMapCanvas(QWidget):
         # ── 鼠标状态
         self._drawing   = False
         self._last_cpos: Optional[Tuple[float, float]] = None
+        self._last_stroke_dir = None  # 上一段笔触方向（用于 stamp 间方向插值）
 
         # ── 右键拖动状态
         self._panning        = False
@@ -364,6 +366,10 @@ class VectorMapCanvas(QWidget):
         # ── Undo 历史栈（每次落笔前保存快照）
         self._undo_stack: list = []          # list of np.ndarray (HxWx3 float32)
         self._undo_max   = 30                # 最多保留 30 步
+
+        # ── Falloff mask 缓存（相同 size+hardness 时复用，避免重复计算）
+        self._falloff_cache: Optional[np.ndarray] = None
+        self._falloff_key: Tuple[int, float] = (0, 0.0)
 
         # ── 显示缓存
         self._pix_rect: Optional[QRect] = None
@@ -707,8 +713,12 @@ class VectorMapCanvas(QWidget):
         x0 = int(cx - s / 2)
         y0 = int(cy - s / 2)
 
-        # 生成 falloff mask
-        mask = make_falloff_mask(s, self.brush_hardness)  # sxs float32
+        # 生成 falloff mask（缓存：相同 size+hardness 时直接复用）
+        key = (s, self.brush_hardness)
+        if key != self._falloff_key or self._falloff_cache is None:
+            self._falloff_cache = make_falloff_mask(s, self.brush_hardness)
+            self._falloff_key = key
+        mask = self._falloff_cache
 
         # ── 确定目标法线向量 (tx, ty, tz) ──────────────────────────────
         if self.mode == "draw":
@@ -853,6 +863,7 @@ class VectorMapCanvas(QWidget):
         if e.button() == Qt.LeftButton:
             self._drawing = True
             self._push_undo()  # 落笔前保存快照
+            self._last_stroke_dir = None  # 重置上一段方向（用于 stamp 间方向插值）
             cp = self._widget_to_canvas(e.pos())
             if cp:
                 if not self.follow_stroke:
@@ -915,12 +926,38 @@ class VectorMapCanvas(QWidget):
                     # spacing = brush_size × spacing%，连续性参数控制密度
                     spacing = max(1.0, self.brush_size * (self.brush_spacing / 100.0))
                     steps = max(1, int(dist / spacing))
+
+                    # ── 方案②：stamp 间方向插值 ──────────────────────
+                    # 归一化当前段方向
+                    if dist > 1e-6:
+                        curr_dir = (dx / dist, dy / dist)
+                    else:
+                        curr_dir = (0.0, 0.0)
+
+                    # 确定插值起始方向：如果有上一段方向则从上一段过渡，否则直接用当前方向
+                    if self._last_stroke_dir is not None and curr_dir != (0.0, 0.0):
+                        prev_dir = self._last_stroke_dir
+                    else:
+                        prev_dir = curr_dir  # 第一段：无插值，直接用当前方向
+
                     for i in range(1, steps + 1):
                         t = i / steps
+                        # 在 prev_dir → curr_dir 之间线性插值方向
+                        interp_x = prev_dir[0] * (1.0 - t) + curr_dir[0] * t
+                        interp_y = prev_dir[1] * (1.0 - t) + curr_dir[1] * t
+                        # 归一化插值后的方向（防止 lerp 导致长度不为 1）
+                        interp_len = math.sqrt(interp_x * interp_x + interp_y * interp_y)
+                        if interp_len > 1e-8:
+                            interp_x /= interp_len
+                            interp_y /= interp_len
                         self._apply_brush(
                             lx + dx * t, ly + dy * t,
-                            dx, dy  # 笔触方向
+                            interp_x, interp_y  # 插值后的方向（已归一化）
                         )
+
+                    # 记录当前段方向，供下一段插值使用
+                    if curr_dir != (0.0, 0.0):
+                        self._last_stroke_dir = curr_dir
                 else:
                     self._apply_brush(cp[0], cp[1], 0.0, 0.0)
                 self._last_cpos = cp
@@ -1012,7 +1049,7 @@ class VectorResultWidget(QWidget):
         self._cached_pix: Optional[QPixmap] = None
         self._cached_key  = None
         self.setStyleSheet(
-            "background:#0d0d1a; border:1px solid #313244; border-radius:8px;"
+            f"background:{T.bg_surface}; border:1px solid {T.border_subtle}; border-radius:8px;"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -1148,7 +1185,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
         ref_header = QHBoxLayout()
         ref_title = QLabel("参考图")
         ref_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        ref_title.setStyleSheet("color:#89dceb; font-size:11px; font-weight:600;")
+        ref_title.setStyleSheet(f"color:{T.info}; font-size:11px; font-weight:600;")
         ref_header.addWidget(ref_title)
         ref_header.addStretch()
         left.addLayout(ref_header)
@@ -1160,9 +1197,9 @@ class FlowMapTab(ExportDirMixin, QWidget):
         result_header = QHBoxLayout()
         normal_title = QLabel("法线结果")
         normal_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        normal_title.setStyleSheet("color:#f38ba8; font-size:11px; font-weight:600;")
+        normal_title.setStyleSheet(f"color:{T.error}; font-size:11px; font-weight:600;")
         self.chk_show_all = QCheckBox("显示全图")
-        self.chk_show_all.setStyleSheet("color:#a6adc8; font-size:10px;")
+        self.chk_show_all.setStyleSheet(f"color:{T.text_secondary}; font-size:10px;")
         self.chk_show_all.setChecked(False)
         result_header.addWidget(normal_title)
         result_header.addStretch()
@@ -1178,9 +1215,9 @@ class FlowMapTab(ExportDirMixin, QWidget):
         # 工具栏
         toolbar_group = QGroupBox("向量场绘制工具")
         toolbar_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:16px; padding-top:10px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; }"
+            f"QGroupBox {{ border:1px solid {T.accent}; border-radius:8px;"
+            f"margin-top:16px; padding-top:10px; }}"
+            f"QGroupBox::title {{ color:{T.accent}; left:10px; }}"
         )
         tb = QGridLayout(toolbar_group)
         tb.setHorizontalSpacing(10)
@@ -1195,10 +1232,10 @@ class FlowMapTab(ExportDirMixin, QWidget):
         self.btn_erase.setCheckable(True)
         self.btn_draw.setChecked(True)
         self.btn_draw.setStyleSheet(
-            "QPushButton:checked { background:#89b4fa; color:#1e1e2e; }"
+            f"QPushButton:checked {{ background:{T.accent}; color:{T.bg_base}; }}"
         )
         self.btn_erase.setStyleSheet(
-            "QPushButton:checked { background:#f38ba8; color:#1e1e2e; }"
+            f"QPushButton:checked {{ background:{T.error}; color:{T.bg_base}; }}"
         )
         mode_row = QHBoxLayout()
         mode_row.addWidget(self.btn_draw)
@@ -1270,22 +1307,22 @@ class FlowMapTab(ExportDirMixin, QWidget):
         dir_row = QHBoxLayout()
         self.chk_follow = QCheckBox("跟随笔触方向")
         self.chk_follow.setChecked(True)
-        self.chk_follow.setStyleSheet("color:#a6e3a1; font-size:11px;")
+        self.chk_follow.setStyleSheet(f"color:{T.success}; font-size:11px;")
         dir_row.addWidget(self.chk_follow)
         tb.addWidget(QLabel("方向控制："), 6, 0)
         tb.addLayout(dir_row, 6, 1, 1, 3)
 
         # 清空按鈕
         self.btn_clear = QPushButton("清空法线图")
-        self.btn_clear.setStyleSheet("color:#f38ba8;")
+        self.btn_clear.setStyleSheet(f"color:{T.error};")
         tb.addWidget(self.btn_clear, 7, 0, 1, 4)
 
         # ===== UE 参数预览 GroupBox =====
         ue_group = QGroupBox("UE 参数预览")
         ue_group.setStyleSheet(
-            "QGroupBox { border:1px solid #89b4fa; border-radius:8px;"
-            "margin-top:16px; padding-top:12px; }"
-            "QGroupBox::title { color:#89b4fa; left:10px; font-weight:700; }"
+            f"QGroupBox {{ border:1px solid {T.accent}; border-radius:8px;"
+            f"margin-top:16px; padding-top:12px; }}"
+            f"QGroupBox::title {{ color:{T.accent}; left:10px; font-weight:700; }}"
         )
         ue_grid = QGridLayout(ue_group)
         ue_grid.setSpacing(6)
@@ -1323,7 +1360,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
         preview_header = QHBoxLayout()
         preview_header.setContentsMargins(0, 0, 0, 0)
         preview_label = QLabel("预览质量：")
-        preview_label.setStyleSheet("color:#89b4fa; font-size:12px; font-weight:600;")
+        preview_label.setStyleSheet(f"color:{T.accent}; font-size:12px; font-weight:600;")
         self.combo_preview_quality = QComboBox()
         self.combo_preview_quality.addItem("流畅（512）", "smooth")
         self.combo_preview_quality.addItem("清晰（1024）", "clear")
@@ -1335,8 +1372,8 @@ class FlowMapTab(ExportDirMixin, QWidget):
             "极致（2K）：核对细节，帧率可能下降"
         )
         self.combo_preview_quality.setStyleSheet(
-            "QComboBox { color:#cdd6f4; background:#1e1e2e; border:1px solid #45475a;"
-            "           border-radius:4px; padding:2px 6px; font-size:12px; }"
+            f"QComboBox {{ color:{T.text_primary}; background:{T.bg_base}; border:1px solid {T.border};"
+            f"           border-radius:4px; padding:2px 6px; font-size:12px; }}"
         )
         self.combo_preview_quality.currentIndexChanged.connect(self._on_preview_quality_changed)
         preview_header.addStretch(1)

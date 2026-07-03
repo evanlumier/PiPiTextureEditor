@@ -18,6 +18,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image, ImageSequence
 
+from theme import T
+
 from PySide6.QtCore import Qt, QTimer, QSize, QRectF, QPointF, Signal, QThread, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QWheelEvent,
@@ -298,7 +300,7 @@ class _LoadingOverlay(QWidget):
         # 阶段文字
         self._stage_label = QLabel("正在加载...")
         self._stage_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._stage_label.setStyleSheet("color: #ddd; font-size: 13px; background: transparent;")
+        self._stage_label.setStyleSheet(f"color: {T.text_primary}; font-size: 13px; background: transparent;")
         c_layout.addWidget(self._stage_label)
 
         # 进度条
@@ -1358,7 +1360,7 @@ class _InfoPanel(QGroupBox):
             row = QHBoxLayout()
             title_label = QLabel(f"{title}：")
             title_label.setFixedWidth(70)
-            title_label.setStyleSheet("color: #999; font-size: 12px;")
+            title_label.setStyleSheet(f"color: {T.text_tertiary}; font-size: 12px;")
             value_label = QLabel("—")
             value_label.setWordWrap(True)
             value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1750,7 +1752,7 @@ class ImageViewerTab(QWidget):
         self._zoom_label = QLabel("100%")
         self._zoom_label.setFixedWidth(60)
         self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._zoom_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        self._zoom_label.setStyleSheet(f"color: {T.text_secondary}; font-size: 12px;")
 
         self._btn_eyedropper = QPushButton("🔍 吸管取色")
         self._btn_eyedropper.setFixedHeight(32)
@@ -1825,7 +1827,7 @@ class ImageViewerTab(QWidget):
 
         # --- 内置支持的格式 ---
         lbl_builtin_title = QLabel("内置支持")
-        lbl_builtin_title.setStyleSheet("color: #8cf; font-weight: bold; font-size: 12px;")
+        lbl_builtin_title.setStyleSheet(f"color: {T.info}; font-weight: bold; font-size: 12px;")
         status_layout.addWidget(lbl_builtin_title)
 
         builtin_formats = [
@@ -1851,12 +1853,12 @@ class ImageViewerTab(QWidget):
         # --- 分隔线 ---
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet("color: #555;")
+        sep1.setStyleSheet(f"color: {T.text_disabled};")
         status_layout.addWidget(sep1)
 
         # --- 需要额外依赖的格式 ---
         lbl_optional_title = QLabel("扩展支持（需额外依赖）")
-        lbl_optional_title.setStyleSheet("color: #8cf; font-weight: bold; font-size: 12px;")
+        lbl_optional_title.setStyleSheet(f"color: {T.info}; font-weight: bold; font-size: 12px;")
         status_layout.addWidget(lbl_optional_title)
 
         psd_ok = _try_import_psd() is not None
@@ -1881,7 +1883,7 @@ class ImageViewerTab(QWidget):
         # --- 分隔线 ---
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("color: #555;")
+        sep2.setStyleSheet(f"color: {T.text_disabled};")
         status_layout.addWidget(sep2)
 
         right_layout.addWidget(status_group)
