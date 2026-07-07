@@ -53,6 +53,38 @@
    - **末行必须是** `有任何问题，请联系eyvanlu`
    - 中间空行用来分段，格式随意
 
+### 🚨 阶段 1.5：架构变更红线检查表（每次发版必查）
+
+> **本节新增于 v0.8.10 加固**。目的：把"本次能不能走增量更新"这个判断，从**依赖记忆**变成**依赖清单**。
+>
+> **反面案例**：v0.8.9 事故的根因就是没有这个表——本次拆出了 `theme.py` 新模块，但发版时没意识到"新增 py 文件"必须走完整包，结果老用户走增量更新时 theme.py 没被下来，`ImportError` → 用户装完打不开。
+
+**在写 release_notes.txt 前，逐条对照下列 6 个问题。任何一项答"是"，本次必须标记为完整包发版**（详见 [RELIABILITY_PLAN.md](./RELIABILITY_PLAN.md) B 章节 UPDATE_MODE 协议）：
+
+- [ ] 本次是否**新增了 `app/*.py` 文件**？
+      （例：v0.8.9 新增了 `app/theme.py`）
+- [ ] 本次是否**删除了 `app/*.py` 文件**？
+- [ ] 本次是否**修改了 import 语句**引入了此前未使用过的第三方库？
+      （例：新增 `import cv2`、`import moviepy` 等）
+- [ ] 本次是否**修改了 `_internal/` 里的依赖版本**？
+      （例：升级了 opencv-python、PySide6 等）
+- [ ] 本次是否**修改了 `launcher.py` 的 `EXPECTED_MODULES` 清单**？
+      （v0.8.10 起 launcher.py 里有此常量）
+- [ ] 本次是否**修改了 `皮皮贴图修改器.spec` 的 hiddenimports**？
+
+**执行规则**：
+
+| 检查结果 | UPDATE_MODE 值 | 说明 |
+|---------|---------------|------|
+| 全部为「否」 | `incremental` | 老用户可走增量更新（自动） |
+| 任一为「是」 | `full` | 老用户被强制引导下完整包（弹窗） |
+
+**填写位置**：`release_notes.txt` 第二行（版本号之后）。具体协议格式见 [RELIABILITY_PLAN.md](./RELIABILITY_PLAN.md) B 章节，v0.8.10 起阶段 2 会同步更新 release_notes 模板。
+
+**在此之前（v0.8.10 加固完成前）**：本节先做人工判断记录，如任一为"是"，请在**用户群通知**中显式提醒"请下完整包"。
+
+---
+
 ### 阶段 2：写入 release_notes.txt（UTF-8 无 BOM）
 
 **⚠️ 关键：不要用记事本/VSCode 直接保存**（默认可能带 BOM 或用 GBK）。用下面这段 PowerShell 一次性写入：
@@ -244,6 +276,38 @@ git add app/version.py CHANGELOG
 git commit -m "release: v$version"
 git push origin (git rev-parse --abbrev-ref HEAD)
 ```
+
+### 📢 阶段 10.5：Release 描述固定模板（每次发版必用）
+
+> **本节新增于 v0.8.10 加固**。目的：让主动来 GitHub 看新版本的用户，第一时间被拦住，避免踩"跳版升级"的坑。
+
+**每次执行阶段 11 的 `gh release create` 前，必须先准备好包含以下模板的 notes 文件**（可以直接用 release_notes.txt，也可以专门准备一个 `release_description.md` 供 GitHub Release 页面使用）：
+
+```markdown
+## ⚠ 从 v0.8.9 及以下版本升级的用户请注意
+
+如果你当前使用的是 v0.8.9 或更早版本，**请务必先手动下载并安装 v0.8.10 完整包**（这是可靠性加固版），之后的所有更新才能自动完成：
+
+👉 [下载 v0.8.10 完整包](https://github.com/evanlumier/PiPiTextureEditor/releases/tag/v0.8.10)
+
+如果你已经在 v0.8.10 及以上，可以直接使用软件内的自动更新，或下载本页面的 zip 手动更新。
+
+---
+
+## 📝 本版本更新内容
+
+（此处填写本版本 changelog，即 release_notes.txt 的内容）
+```
+
+**强制步骤**：
+
+1. **v0.8.10 本身发版时**：这段模板顶部就是引导目标（"请下 v0.8.10"），一定要保留。
+2. **v0.8.11 及以后每次发版**：模板顶部这段引导语**保留不删**，作为长期兜底。
+3. **准备方式**：可以把上面的模板 + `release_notes.txt` 内容合并到一个 `release_description.md`，然后阶段 11 里用 `--notes-file .\release_description.md` 替代 `--notes-file .\release_notes.txt`。
+
+**⚠ 注意**：`release_notes.txt` 是**软件内更新弹窗**读取的（app/updater.py），走 UTF-8 无 BOM 严格协议；而 `release_description.md` 是**GitHub Release 网页**上展示的，两者不冲突，可以内容不同。
+
+---
 
 ### 阶段 11：创建 GitHub Release
 

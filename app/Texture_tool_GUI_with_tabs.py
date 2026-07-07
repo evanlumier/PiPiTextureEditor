@@ -1170,6 +1170,37 @@ class MainWindow(ExportDirMixin, QMainWindow):
         if len(changelog) > 600:
             changelog = changelog[:600] + "\n..."
 
+        # ── 【关卡 1 · UI 引导】协议代际不兼容：引导用户手动下完整包 ──
+        # updater.check_for_update 判断远程 __min_compatible_version__ 高于本地版本时，
+        # 会在返回 dict 里塞 require_full_install=True。这时增量更新不安全，
+        # 弹一个"引导下载完整安装包"的弹窗，避免自动走增量替换踩坑。
+        if info.get("require_full_install"):
+            guide_msg = QMessageBox(self)
+            guide_msg.setWindowTitle("发现新版本（需手动安装）")
+            guide_msg.setIcon(QMessageBox.Warning)
+            guide_msg.setText(
+                f"发现新版本 v{new_version}\n"
+                f"当前版本 v{__version__}\n\n"
+                "本次更新涉及架构性变更，无法通过在线增量更新完成。\n"
+                "请前往 GitHub 手动下载完整安装包并覆盖安装。\n\n"
+                f"更新内容：\n{changelog}"
+            )
+            btn_open = guide_msg.addButton("打开下载页", QMessageBox.AcceptRole)
+            btn_cancel = guide_msg.addButton("取消", QMessageBox.RejectRole)
+            guide_msg.setDefaultButton(btn_open)
+            guide_msg.exec()
+            if guide_msg.clickedButton() == btn_open:
+                try:
+                    import webbrowser
+                    webbrowser.open(
+                        "https://github.com/evanlumier/PiPiTextureEditor/releases/latest"
+                    )
+                except Exception:
+                    # 打开浏览器失败也不影响主程序继续运行
+                    pass
+            # 不管用户选哪个，都不再走"立即更新"流程
+            return
+
         msg = QMessageBox(self)
         msg.setWindowTitle("发现新版本")
         msg.setIcon(QMessageBox.Information)
@@ -1334,14 +1365,26 @@ class MainWindow(ExportDirMixin, QMainWindow):
                 retry_msg.setIcon(QMessageBox.Warning)
                 retry_msg.setText(
                     f"更新时出错：\n{err_msg}\n\n"
+                    "如反复失败，建议前往 GitHub 手动下载完整安装包。\n"
                     "程序将继续使用当前版本。"
                 )
                 btn_retry = retry_msg.addButton("重试", QMessageBox.AcceptRole)
+                btn_open = retry_msg.addButton("下载完整包", QMessageBox.ActionRole)
                 btn_close = retry_msg.addButton("关闭", QMessageBox.RejectRole)
                 retry_msg.setDefaultButton(btn_retry)
                 retry_msg.exec()
-                if retry_msg.clickedButton() == btn_retry:
+                clicked = retry_msg.clickedButton()
+                if clicked == btn_retry:
                     self._do_update(download_url)
+                elif clicked == btn_open:
+                    # 引导用户前往 Release 页手动下载完整包（关卡 2 二次校验失败时的兜底出口）
+                    try:
+                        import webbrowser
+                        webbrowser.open(
+                            "https://github.com/evanlumier/PiPiTextureEditor/releases/latest"
+                        )
+                    except Exception:
+                        pass
 
         def on_cancelled():
             """用户取消了下载，关闭进度条"""

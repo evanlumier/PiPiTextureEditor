@@ -28,6 +28,19 @@ from urllib.error import URLError
 
 from version import __version__
 
+# —— 更新协议元数据（v0.8.10 加固版起启用） ——
+# 说明：老版本的 version.py 可能没有这两个常量，用 try 兜底避免更新逻辑
+# 反而先崩掉。缺失时按最保守值处理：本地协议 = 1，兼容底 = 当前版本。
+try:
+    from version import __update_protocol__ as _LOCAL_UPDATE_PROTOCOL  # type: ignore
+except ImportError:
+    _LOCAL_UPDATE_PROTOCOL = 1
+
+try:
+    from version import __min_compatible_version__ as _LOCAL_MIN_COMPATIBLE  # type: ignore
+except ImportError:
+    _LOCAL_MIN_COMPATIBLE = __version__
+
 # 更新模块日志（仅在开发调试时有用）
 _log = logging.getLogger("updater")
 
@@ -422,6 +435,93 @@ def _parse_remote_version(content: str) -> str | None:
     return None
 
 
+def _parse_remote_version_info(content: str) -> dict | None:
+    """
+    从远程 version.py 文件内容中一并提取协议元数据。
+
+    返回 dict:
+        {
+            "version": "0.8.10",              # 必须
+            "protocol": 2 | None,              # 可选，__update_protocol__
+            "min_compatible": "0.8.10" | None, # 可选，__min_compatible_version__
+        }
+    如果连版本号都拿不到，返回 None（视为拉取失败）。
+    """
+    ver = _parse_remote_version(content)
+    if not ver:
+        return None
+
+    # 协议号：__update_protocol__ = 2 （无引号的整数）
+    proto: int | None = None
+    m_proto = re.search(r'__update_protocol__\s*=\s*(\d+)', content)
+    if m_proto:
+        try:
+            proto = int(m_proto.group(1))
+        except ValueError:
+            proto = None
+
+    # 兼容底：__min_compatible_version__ = "0.8.10"
+    min_compat: str | None = None
+    m_min = re.search(
+        r'__min_compatible_version__\s*=\s*["\']([^"\']+)["\']',
+        content,
+    )
+    if m_min:
+        min_compat = m_min.group(1)
+
+    return {
+        "version": ver,
+        "protocol": proto,
+        "min_compatible": min_compat,
+    }
+
+
+def _is_incremental_update_safe(
+    remote_protocol: int | None,
+    remote_min_compatible: str | None,
+) -> tuple[bool, str]:
+    """
+    判断当前本地客户端能否安全走"增量"更新。
+
+    规则（Q2=Y 宽松策略：拿不到远程协议信息 → 视为兼容，交给下载后的 zip 二次校验兜底）：
+      1. 远程未提供任何协议信息 → 视为兼容（老版本 release）。
+      2. 本地协议号 >= 远程 __min_compatible_version__ 对应的协议要求：
+         - 若远程给了 min_compatible 版本号，本地 __version__ 必须 >= 该版本，
+           否则说明本地过旧、走增量会破坏架构，判定不安全。
+      3. 远程协议 - 本地协议 差距 >= 1 且远程未给出兼容底：视为不安全（保守）。
+
+    返回 (safe: bool, reason: str)。
+    """
+    # 远程协议信息完全缺失 → 视为兼容（Q2=Y 宽松兜底）
+    if remote_protocol is None and remote_min_compatible is None:
+        return True, "remote_no_protocol_info"
+
+    # 只要远程明确给出兼容底，就以兼容底为准做严格判断
+    if remote_min_compatible:
+        try:
+            local_v = _parse_version(__version__)
+            min_v = _parse_version(remote_min_compatible)
+            if local_v < min_v:
+                return False, (
+                    f"local_below_min_compatible: {__version__} < {remote_min_compatible}"
+                )
+        except Exception:
+            # 解析失败按保守处理
+            return False, "parse_min_compatible_failed"
+
+    # 远程只给了协议号：与本地做代际差比较
+    if remote_protocol is not None:
+        try:
+            if int(remote_protocol) > int(_LOCAL_UPDATE_PROTOCOL):
+                return False, (
+                    f"protocol_gap: local={_LOCAL_UPDATE_PROTOCOL} < remote={remote_protocol}"
+                )
+        except Exception:
+            pass
+
+    return True, "compatible"
+
+
 # ── 内部：获取远程最新版本号 ─────────────────────────────────────
 def _fetch_remote_version() -> str | None:
     """
@@ -442,6 +542,24 @@ def _fetch_remote_version() -> str | None:
         if ver:
             return ver
 
+    return None
+
+
+def _fetch_remote_version_info() -> dict | None:
+    """
+    从远程 version.py 一并读回版本号 + 协议信息。
+
+    返回 dict：{"version": ..., "protocol": ..., "min_compatible": ...}，
+    连版本号都拿不到时返回 None。
+    与 _fetch_remote_version() 一样优先 curl 后退 urllib。
+    """
+    for fetcher in (_fetch_text_via_curl, _fetch_text_via_urllib):
+        content = fetcher(_VERSION_CHECK_URL)
+        if not content:
+            continue
+        info = _parse_remote_version_info(content)
+        if info and info.get("version"):
+            return info
     return None
 
 
@@ -504,14 +622,14 @@ def check_for_update(force: bool = False) -> dict | None:
             # 哨兵值表示"已检查过且无更新"，返回 None
             return None if cached == _CACHE_NO_UPDATE else cached
 
-    # ── 获取远程最新版本号 ──
-    remote_version = None
+    # ── 获取远程最新版本号 + 协议信息 ──
+    remote_info: dict | None = None
     last_error = None
 
     for attempt in range(_MAX_RETRIES):
         try:
-            remote_version = _fetch_remote_version()
-            if remote_version:
+            remote_info = _fetch_remote_version_info()
+            if remote_info and remote_info.get("version"):
                 break
         except Exception as e:
             last_error = e
@@ -519,8 +637,12 @@ def check_for_update(force: bool = False) -> dict | None:
         if attempt < _MAX_RETRIES - 1:
             time.sleep(_RETRY_DELAY)
 
-    if not remote_version:
+    if not remote_info or not remote_info.get("version"):
         raise ConnectionError("无法连接更新服务器，请检查网络连接")
+
+    remote_version = remote_info["version"]
+    remote_protocol = remote_info.get("protocol")
+    remote_min_compatible = remote_info.get("min_compatible")
 
     # ── 比较版本号 ──
     latest_ver = _parse_version(remote_version)
@@ -540,11 +662,26 @@ def check_for_update(force: bool = False) -> dict | None:
     # ── 获取 changelog（可选，失败不影响）──
     changelog = _fetch_changelog(version_str)
 
+    # ── 协议代际兼容性判断（v0.8.10 加固版新增） ──
+    # 判定不安全时，UI 层应引导用户去下完整包，而不是自动增量替换。
+    incremental_safe, protocol_reason = _is_incremental_update_safe(
+        remote_protocol, remote_min_compatible
+    )
+    if not incremental_safe:
+        _log.warning(
+            "检测到协议代际不兼容，需要完整安装包（原因：%s）", protocol_reason
+        )
+
     result = {
         "version": version_str,
         "download_url": download_url,
         "changelog": changelog,
         "asset_name": asset_name,
+        # 新增字段（旧 UI 可以忽略，新 UI 可以据此弹“手动下完整包”引导弹窗）
+        "remote_protocol": remote_protocol,
+        "min_compatible_version": remote_min_compatible,
+        "require_full_install": not incremental_safe,
+        "protocol_reason": protocol_reason,
     }
     # 缓存有新版本的结果
     _update_check_cache["result"] = result
@@ -861,6 +998,41 @@ def apply_update(zip_path: str, progress_callback=None) -> bool:
         current_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), f"ppeditor_update_{current_pid}.bat")
 
+        # ── 【二次校验】读取 zip 内 app/version.py 的协议信息（v0.8.10 加固版起启用） ──
+        # 目的：远程 raw CDN 那份 version.py 有可能被缓存/网络抖动，第一次判断可能被绕过。
+        # 但下载完成解压后的 version.py 是100%权威的，这里做严格判断，防止不兼容的增量替换真的落地。
+        # 一旦这里判定不兼容 → 中止更新、清理锁文件与解压目录、返回 False；由 UI 引导用户手动下完整包。
+        try:
+            zip_version_py = os.path.join(source_dir, "app", "version.py")
+            if os.path.isfile(zip_version_py):
+                with open(zip_version_py, "r", encoding="utf-8") as _vf:
+                    _v_content = _vf.read()
+                _zip_info = _parse_remote_version_info(_v_content)
+                if _zip_info:
+                    _zip_proto = _zip_info.get("protocol")
+                    _zip_min = _zip_info.get("min_compatible")
+                    _safe, _reason = _is_incremental_update_safe(_zip_proto, _zip_min)
+                    if not _safe:
+                        _log.error(
+                            "zip 内二次校验：协议不兼容，拒绝增量替换（原因: %s）", _reason
+                        )
+                        _progress(0, "更新包与当前版本架构不兼容，请前往 GitHub 下载完整安装包")
+                        # 清理锁文件（注意：此时锁文件已写，必须清理，否则下次启动会误判为中断更新）
+                        try:
+                            if os.path.exists(lock_file):
+                                os.remove(lock_file)
+                        except Exception:
+                            pass
+                        # 清理解压目录
+                        try:
+                            shutil.rmtree(extract_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                        return False
+            # zip 里没有 app/version.py（可能是老架构全量包），此处不拦截，交给下方 is_split_arch 分支处理
+        except Exception as _e:
+            _log.debug("zip 内二次校验读取失败（不拦截，走后续分支）: %s", _e)
+
         # ── 智能检测新版本包结构 ──
         new_has_app_dir = os.path.isdir(os.path.join(source_dir, "app"))
         is_split_arch = new_has_app_dir or (code_dir != app_dir)
@@ -1162,3 +1334,49 @@ def cleanup_old_version():
             shutil.rmtree(backup_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+# ── 跳版警告代际标记（v0.8.10 加固版起启用） ──
+# 文件位置固定为 %APPDATA%\PPTextureEditor\updater_generation.txt
+# 只要 v0.8.10 及以后版本的 updater 被启动过一次，就会写入当前版本号。
+# 后续 launcher 启动时读取该文件：
+#   · 文件不存在 或 值 < 0.8.10 → 判定为"跳版用户"，弹提醒（不阻断启动）
+#   · 值 >= 0.8.10             → 静默通过
+# 这样可以在用户漏装 v0.8.10 加固版、直接从 v0.8.9 跳到 v0.8.11+ 时主动提醒。
+_UPDATER_GENERATION_DIR_NAME = "PPTextureEditor"
+_UPDATER_GENERATION_FILE_NAME = "updater_generation.txt"
+
+
+def _get_updater_generation_path() -> str | None:
+    """
+    获取 updater_generation.txt 的完整路径。
+    非 Windows 或 APPDATA 环境变量缺失时返回 None（视为不写入）。
+    """
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(appdata, _UPDATER_GENERATION_DIR_NAME, _UPDATER_GENERATION_FILE_NAME)
+
+
+def write_updater_generation() -> bool:
+    """
+    将当前版本号写入 %APPDATA%\\PPTextureEditor\\updater_generation.txt。
+    应在每次 updater 模块被导入并进入正常启动流程时调用一次（幂等）。
+
+    这是"跳版警告"机制的写入端，配合 launcher.check_updater_generation() 使用。
+    任何异常都吞掉——写不上不能影响用户正常启动。
+
+    返回 True 表示写入成功，False 表示失败或环境不支持。
+    """
+    path = _get_updater_generation_path()
+    if not path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 只写版本号本身，UTF-8 无 BOM，末尾不加换行，方便 launcher 精确比较
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(__version__)
+        return True
+    except Exception as e:
+        _log.warning("写入 updater_generation.txt 失败：%s", e)
+        return False
