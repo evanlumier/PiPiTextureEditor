@@ -53,35 +53,38 @@
    - **末行必须是** `有任何问题，请联系eyvanlu`
    - 中间空行用来分段，格式随意
 
-### 🚨 阶段 1.5：架构变更红线检查表（每次发版必查）
+### 🚨 阶段 1.5：打包完整性红线自检（每次发版必查）
 
-> **本节新增于 v0.8.10 加固**。目的：把"本次能不能走增量更新"这个判断，从**依赖记忆**变成**依赖清单**。
+> **本节新增于 v0.8.10 加固**。**⚠️ 认知更正（v0.8.10 复盘）**：早期版本的本节曾把 v0.8.9 事故归因为"老 updater 是增量策略、theme.py 没被下下来"，这是错的。查证 v0.8.5～v0.8.8 的 app/updater.py 源码后可确认：
 >
-> **反面案例**：v0.8.9 事故的根因就是没有这个表——本次拆出了 `theme.py` 新模块，但发版时没意识到"新增 py 文件"必须走完整包，结果老用户走增量更新时 theme.py 没被下来，`ImportError` → 用户装完打不开。
+> **老 updater（v0.8.8 及以下）一直都是"全量替换"策略**：下载完整 zip → 解压 → `xcopy /s /e /y` 递归全量复制到 app_dir → 备份旧目录 → 失败自动回滚。换句话说，只要 zip 本身内容完整，老用户升级就绝不会出现"新增文件没被下下来"的问题。
+>
+> **v0.8.9 事故真正的元凶**：那次同一个 commit（`7bbe058`）同时改了 3 件事——① 新增 `app/theme.py`；② 大改 `build.ps1` 打包脚本（+122 行，包括 Python 路径改为注册表动态解析、release_notes 智能去重等）；③ 多个 tab 文件把硬编码颜色改成 `T.xxx` 引用。**打包脚本被大改后没做冒烟测试就发版**，导致打出来的 zip 本身就有问题（要么 theme.py 没进 zip，要么 hiddenimports 没跟上），用户下下来当然打不开。**根因不在升级机制，根因在打包环节**。
+>
+> 所以本节的核心目的不是判断"走增量还是全量"（老 updater 本来就是全量），而是把"每次发版前必须做的完整性检查"变成清单，防止 v0.8.9 那种"打包翻车没人发现就发出去"的事故重演。
 
-**在写 release_notes.txt 前，逐条对照下列 6 个问题。任何一项答"是"，本次必须标记为完整包发版**（详见 [RELIABILITY_PLAN.md](./RELIABILITY_PLAN.md) B 章节 UPDATE_MODE 协议）：
+**在写 release_notes.txt 前，逐条对照下列 6 个问题。任何一项答"是"，请在阶段 6/8/9（产物校验/zip 校验/冒烟测试）中格外仔细，并强烈建议在阶段 10.5 的 Release 描述里显式提醒用户"本版本有依赖变更，如自动更新异常请下完整包"**：
 
 - [ ] 本次是否**新增了 `app/*.py` 文件**？
-      （例：v0.8.9 新增了 `app/theme.py`）
+      （例：v0.8.9 新增了 `app/theme.py`——必须确认它出现在阶段 6 的 `$distPy` 计数里、且出现在阶段 8 的 zip entries 里）
 - [ ] 本次是否**删除了 `app/*.py` 文件**？
+      （必须确认源 app/ 和 dist app/ 都不含该文件，避免残留导致 import 混乱）
 - [ ] 本次是否**修改了 import 语句**引入了此前未使用过的第三方库？
-      （例：新增 `import cv2`、`import moviepy` 等）
+      （例：新增 `import cv2`、`import moviepy` 等——**必须**同步更新 `皮皮贴图修改器.spec` 的 hiddenimports）
 - [ ] 本次是否**修改了 `_internal/` 里的依赖版本**？
-      （例：升级了 opencv-python、PySide6 等）
-- [ ] 本次是否**修改了 `launcher.py` 的 `EXPECTED_MODULES` 清单**？
-      （v0.8.10 起 launcher.py 里有此常量）
-- [ ] 本次是否**修改了 `皮皮贴图修改器.spec` 的 hiddenimports**？
+      （例：升级了 opencv-python、PySide6 等——阶段 9 冒烟测试要覆盖到这个依赖对应的功能）
+- [ ] 本次是否**修改了 `launcher.py` 的 `_EXPECTED_APP_MODULES` 清单**？
+      （v0.8.10 起 launcher.py 里有此常量，用于启动自检——清单必须与 app/ 实际 .py 一致）
+- [ ] 本次是否**修改了 `皮皮贴图修改器.spec` 的 hiddenimports / datas`**？
+      （改完后必须重跑阶段 4 打包，不能沿用上次的 build/ 缓存）
 
-**执行规则**：
+**执行原则**：
 
-| 检查结果 | UPDATE_MODE 值 | 说明 |
-|---------|---------------|------|
-| 全部为「否」 | `incremental` | 老用户可走增量更新（自动） |
-| 任一为「是」 | `full` | 老用户被强制引导下完整包（弹窗） |
+- 无论上述有几项为"是"，**阶段 6（产物校验）、阶段 8（zip 校验）、阶段 9（冒烟测试）都不允许跳过**。这三关是 v0.8.9 事故后加的最重要护栏。
+- 如果任一项为"是"且不太确定影响面，强烈建议在阶段 9 冒烟测试里**多测一遍受影响的功能**（例如新增了 theme.py 就要打开所有 tab 看主题是否正常）。
+- 如果历史上出现过 v0.8.9 那样的事故重演（用户装完打不开），无论发布多久都**立刻撤 release**（`gh release delete vX.Y.Z --yes`），修好后重发。
 
-**填写位置**：`release_notes.txt` 第二行（版本号之后）。具体协议格式见 [RELIABILITY_PLAN.md](./RELIABILITY_PLAN.md) B 章节，v0.8.10 起阶段 2 会同步更新 release_notes 模板。
-
-**在此之前（v0.8.10 加固完成前）**：本节先做人工判断记录，如任一为"是"，请在**用户群通知**中显式提醒"请下完整包"。
+> **关于 UPDATE_MODE 协议（v0.8.10 引入的 release_notes 元数据行）**：这是 v0.8.10 加进去的**前瞻性开关**，为未来"如果哪天真要引入差分/增量升级机制"预留切换能力。**目前（v0.8.10 时点）新老 updater 都走全量替换**，所以 release_notes 里写不写 `[UPDATE_MODE] full`、写什么值，实际效果都一样。写它主要是为了让 0.8.10+ 的新 updater 能够在未来版本切换策略时正确识别本次版本的意图。详细协议见 [RELIABILITY_PLAN.md](./RELIABILITY_PLAN.md) B 章节。
 
 ---
 
@@ -277,20 +280,28 @@ git commit -m "release: v$version"
 git push origin (git rev-parse --abbrev-ref HEAD)
 ```
 
-### 📢 阶段 10.5：Release 描述固定模板（每次发版必用）
+### 📢 阶段 10.5：Release 描述固定模板（可选，按需使用）
 
-> **本节新增于 v0.8.10 加固**。目的：让主动来 GitHub 看新版本的用户，第一时间被拦住，避免踩"跳版升级"的坑。
+> **本节新增于 v0.8.10 加固**。**⚠️ 认知更正（v0.8.10 复盘）**：早期版本的本节曾把这个引导语作为"强制每次发版都要挂"，因为当时误以为 v0.8.9 事故是"跳版升级会导致新增文件没被下下来"。查证后已确认：**老 updater 一直是全量下 zip + 全量替换 app_dir，不存在"跳版会漏文件"的问题**。所以本节从"强制"降级为"可选"。
+>
+> **什么时候需要这段引导语？** 只在"上一个已知有问题的版本"（例如 v0.8.9）还有一定量存量用户、且你希望明确劝退他们直接下完整包时才挂。日常发版**不需要**这段。
 
-**每次执行阶段 11 的 `gh release create` 前，必须先准备好包含以下模板的 notes 文件**（可以直接用 release_notes.txt，也可以专门准备一个 `release_description.md` 供 GitHub Release 页面使用）：
+**软件内更新 vs GitHub 手动下载的差别（供你决策）**：
+
+| 用户升级路径 | 结果 |
+|---|---|
+| 老用户软件内点更新（v0.8.8 → 最新） | 走老 updater 的全量下 zip + xcopy 全量替换，理论上稳定 |
+| 老用户去 GitHub Release 页面手动下 zip 覆盖 | 100% 全量，最保险 |
+| 已经在 v0.8.10+ 的用户 | 有 `_check_app_integrity` 启动自检兜底，即使某次打包漏了文件也会弹窗提示而不是崩溃 |
+
+**如果你确实想挂引导语，模板如下**（每次发版前，把版本号替换成最新的稳定版本号）：
 
 ```markdown
-## ⚠ 从 v0.8.9 及以下版本升级的用户请注意
+## ⚠ 从 v0.8.9 及以下版本升级如有异常
 
-如果你当前使用的是 v0.8.9 或更早版本，**请务必先手动下载并安装 v0.8.10 完整包**（这是可靠性加固版），之后的所有更新才能自动完成：
+如果软件内自动更新后出现异常，请前往 GitHub Release 页面手动下载完整 zip 覆盖安装（100% 全量替换，最保险）：
 
-👉 [下载 v0.8.10 完整包](https://github.com/evanlumier/PiPiTextureEditor/releases/tag/v0.8.10)
-
-如果你已经在 v0.8.10 及以上，可以直接使用软件内的自动更新，或下载本页面的 zip 手动更新。
+👉 [Release 列表](https://github.com/evanlumier/PiPiTextureEditor/releases)
 
 ---
 
@@ -299,11 +310,7 @@ git push origin (git rev-parse --abbrev-ref HEAD)
 （此处填写本版本 changelog，即 release_notes.txt 的内容）
 ```
 
-**强制步骤**：
-
-1. **v0.8.10 本身发版时**：这段模板顶部就是引导目标（"请下 v0.8.10"），一定要保留。
-2. **v0.8.11 及以后每次发版**：模板顶部这段引导语**保留不删**，作为长期兜底。
-3. **准备方式**：可以把上面的模板 + `release_notes.txt` 内容合并到一个 `release_description.md`，然后阶段 11 里用 `--notes-file .\release_description.md` 替代 `--notes-file .\release_notes.txt`。
+**使用方式**：把上面的模板 + `release_notes.txt` 内容合并到一个 `release_description.md`，然后阶段 11 里用 `--notes-file .\release_description.md` 替代 `--notes-file .\release_notes.txt`。
 
 **⚠ 注意**：`release_notes.txt` 是**软件内更新弹窗**读取的（app/updater.py），走 UTF-8 无 BOM 严格协议；而 `release_description.md` 是**GitHub Release 网页**上展示的，两者不冲突，可以内容不同。
 
@@ -365,63 +372,4 @@ gh release view "v$version" --json assets | ConvertFrom-Json |
 
 ---
 
-## 📎 附录 A：build.ps1 原文（存档，仅供参考）
-
-<details>
-<summary>展开查看历史脚本</summary>
-
-```powershell
-# build.ps1 - 皮皮贴图修改器 一键打包脚本（强化版）
-# 用法：
-#   .\build.ps1                              # 默认自动小版本+1（patch+1），交互式输入 notes
-#   .\build.ps1 -BumpPatch:$false            # 不递增版本号，沿用 version.py 里的当前值
-#   .\build.ps1 -Version "v0.9.0"            # 手动指定版本号
-#   .\build.ps1 -NotesFile release_notes.txt # 从文件读取 release notes（跳过交互，用于自动化）
-#
-# ★★★ 设计原则 ★★★
-# 1. 任何关键步骤失败 → 立即 exit 1，绝不允许带病推进
-# 2. 流程最开头就交互式询问 release notes，避免最后才发现忘写
-# 3. release_notes.txt 用 UTF-8 无 BOM 写入，根治中文乱码
-# 4. 本脚本只负责"准备产物"，绝不触碰 git/GitHub，由 release.ps1 推送
-#
-# 打包架构：拆包设计（exe + _internal/ + app/）
-# - 主 exe 文件哈希值固定，iOA 白名单一劳永逸
-# - 未来版本更新只需替换 app/ 目录内容
-
-# 【完整逻辑已迁移到本 md 的阶段 1-8】
-# 【关键实现细节：从注册表 HKLM:\Software\Python\...\InstallPath 读取真实 python 路径】
-# 【关键守门：zip 体积 < 100MB 立即失败；zip 内 app/ 缺失立即失败】
-```
-
-（完整原始脚本已在 v0.8.9 之前的 git 历史里，如需回溯：`git log --all --diff-filter=D -- build.ps1`）
-
-</details>
-
-## 📎 附录 B：release.ps1 原文（存档，仅供参考）
-
-<details>
-<summary>展开查看历史脚本</summary>
-
-```powershell
-# release.ps1 - 皮皮贴图修改器 一键发布脚本
-# 用法：
-#   .\release.ps1                    # Dry-run：只打印将要执行的操作，不实际执行
-#   .\release.ps1 -Confirm           # 实际执行：commit + push + 创建 GitHub Release
-#
-# ★★★ 设计原则 ★★★
-# 1. 必须人工核验 build.ps1 产物之后，再运行此脚本
-# 2. 必须显式传 -Confirm 才会真正动手，否则只 dry-run
-# 3. 任何关键步骤失败 → 立即 exit 1
-# 4. release notes 用 --notes-file 传递，避免命令行中文乱码
-
-# 【完整逻辑已迁移到本 md 的阶段 10-12】
-# 【关键实现：dry-run 模式 / gh release create vs edit --clobber 分支 / 上传后 --json assets 回查】
-```
-
-（完整原始脚本已在 v0.8.9 之前的 git 历史里）
-
-</details>
-
----
-
-_最后更新：2026-07-03，从 build.ps1 + release.ps1 迁移而来。以后每次改流程都直接改本 md。_
+_最后更新：2026-07-07。历史上曾使用 build.ps1 / release.ps1 一键脚本，因 v0.8.9 事故后改为手工对照本 md 执行，脚本已在 commit `b81f237` 删除。如需回溯原脚本：`git show b81f237^:build.ps1` / `git show b81f237^:release.ps1`。_
