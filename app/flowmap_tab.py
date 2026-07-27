@@ -22,6 +22,7 @@ import cv2
 from typing import Optional, Tuple
 
 from export_dir_mixin import ExportDirMixin
+from undo import UndoStack
 from theme import T
 
 from PIL import Image
@@ -364,8 +365,7 @@ class VectorMapCanvas(QWidget):
         self._right_click_callback = None  # 右键单击回调
 
         # ── Undo 历史栈（每次落笔前保存快照）
-        self._undo_stack: list = []          # list of np.ndarray (HxWx3 float32)
-        self._undo_max   = 30                # 最多保留 30 步
+        self._undo = UndoStack(max_len=30)   # 存 normal_map 快照 (HxWx3 float32)
 
         # ── Falloff mask 缓存（相同 size+hardness 时复用，避免重复计算）
         self._falloff_cache: Optional[np.ndarray] = None
@@ -449,7 +449,7 @@ class VectorMapCanvas(QWidget):
         self._ch = new_ch
         # 重建 normal_map（清空绘制内容）
         self.normal_map = self._make_flat_normal()
-        self._undo_stack.clear()
+        self._undo.clear()
         # 清除所有缓存
         self._flow_cache_dirty = True
         self._ref_calc_np = None
@@ -802,19 +802,32 @@ class VectorMapCanvas(QWidget):
         if self.on_normal_updated:
             self.on_normal_updated(self.normal_map)
     # ── Undo ──────────────────────────────────────────────
-    def _push_undo(self):
-        """落笔前保存当前 normal_map 快照到 undo 栈。"""
-        snapshot = self.normal_map.copy()
-        self._undo_stack.append(snapshot)
-        if len(self._undo_stack) > self._undo_max:
-            self._undo_stack.pop(0)
+    def push_undo(self):
+        """落笔前保存当前 normal_map 快照到 undo 栈。公有接口。"""
+        self._undo.push(self.normal_map.copy())
 
     def undo(self):
         """撤回上一笔。"""
-        if not self._undo_stack:
+        snap = self._undo.pop()
+        if snap is None:
             return
-        self.normal_map = self._undo_stack.pop()
-        # 标记缓存失效
+        # 当前态压入 redo，供 Ctrl+Shift+Z 恢复
+        self._undo.push_redo(self.normal_map.copy())
+        self.normal_map = snap
+        self._flow_cache_dirty = True
+        self._normal_vis_dirty = True
+        self.update()
+        if self.on_normal_updated:
+            self.on_normal_updated(self.normal_map)
+
+    def redo(self):
+        """重做上一次 undo。"""
+        snap = self._undo.pop_redo()
+        if snap is None:
+            return
+        # 当前态压回 undo（不清 redo，保持链路对称）
+        self._undo.push_undo_only(self.normal_map.copy())
+        self.normal_map = snap
         self._flow_cache_dirty = True
         self._normal_vis_dirty = True
         self.update()
@@ -823,7 +836,10 @@ class VectorMapCanvas(QWidget):
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z and (e.modifiers() & Qt.ControlModifier):
-            self.undo()
+            if e.modifiers() & Qt.ShiftModifier:
+                self.redo()
+            else:
+                self.undo()
         else:
             super().keyPressEvent(e)
 
@@ -862,7 +878,7 @@ class VectorMapCanvas(QWidget):
         self.setFocus()  # 确保能接收键盘事件
         if e.button() == Qt.LeftButton:
             self._drawing = True
-            self._push_undo()  # 落笔前保存快照
+            self.push_undo()  # 落笔前保存快照
             self._last_stroke_dir = None  # 重置上一段方向（用于 stamp 间方向插值）
             cp = self._widget_to_canvas(e.pos())
             if cp:
@@ -1166,9 +1182,12 @@ class FlowMapTab(ExportDirMixin, QWidget):
 
     # ── 构建 UI ───────────────────────────────────────────────
     def keyPressEvent(self, e):
-        """Tab 层转发 Ctrl+Z 到 canvas。"""
+        """Tab 层转发 Ctrl+Z / Ctrl+Shift+Z 到 canvas。"""
         if e.key() == Qt.Key_Z and (e.modifiers() & Qt.ControlModifier):
-            self.canvas.undo()
+            if e.modifiers() & Qt.ShiftModifier:
+                self.canvas.redo()
+            else:
+                self.canvas.undo()
         else:
             super().keyPressEvent(e)
 
@@ -1483,7 +1502,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
     def _on_ref_drop_loaded(self, img: Optional[Image.Image]):
         """DropRefWidget 导入/清除参考图后的回调。"""
         # 如果画布有绘制内容且新参考图会导致画布尺寸变化，提示用户
-        if self.canvas._undo_stack:
+        if len(self.canvas._undo) > 0:
             # 计算新参考图是否会改变画布尺寸
             will_resize = False
             if img is None:
@@ -1714,7 +1733,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            self.canvas._push_undo()  # 清空前保存快照，支持撤回
+            self.canvas.push_undo()  # 清空前保存快照，支持撤回
             self.canvas.clear_canvas()
 
     # ── 尺寸 ──────────────────────────────────────────────────────────

@@ -1629,7 +1629,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
             nm = nm / length
 
             # 保存 undo 快照，然后写入 normal_map
-            canvas._push_undo()
+            canvas.push_undo()
             canvas.normal_map = nm
             canvas._flow_cache_dirty = True
             canvas._normal_vis_dirty = True

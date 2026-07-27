@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 
 from theme import T
+from undo import UndoStack
 
 from PySide6.QtCore import Qt, QRect, QPoint, QPointF, Signal
 from PySide6.QtGui import (
@@ -121,8 +122,7 @@ class CropCanvas(QLabel):
         self._eraser_size: int = 20  # 笔刷半径（px，图片像素）
         self._eraser_feather: int = 5  # 羽化半径（px）
         self._eraser_drawing: bool = False  # 是否正在绘制
-        self._eraser_undo_stack: list = []  # undo栈，存储Alpha通道快照
-        self._eraser_max_undo: int = 15  # 最大undo步数
+        self._eraser_undo = UndoStack(max_len=15)  # undo栈，存储Alpha通道快照
         self._eraser_brush_mask: Optional[np.ndarray] = None  # 预计算的笔刷mask
         self._eraser_mouse_pos: Optional[QPoint] = None  # 当前鼠标位置（用于绘制光标）
 
@@ -155,7 +155,7 @@ class CropCanvas(QLabel):
             need_bake = False
             if old_mode == self.MODE_ROTATE and abs(self._rotation_angle) > 0.01:
                 need_bake = True
-            elif old_mode == self.MODE_ERASER and len(self._eraser_undo_stack) > 0:
+            elif old_mode == self.MODE_ERASER and len(self._eraser_undo) > 0:
                 need_bake = True
             if need_bake:
                 self._bake_current_state()
@@ -664,17 +664,31 @@ class CropCanvas(QLabel):
         """开始一笔：保存当前Alpha通道快照到undo栈"""
         arr = np.array(self.pil_img, dtype=np.uint8)
         alpha_snapshot = arr[:, :, 3].copy()
-        self._eraser_undo_stack.append(alpha_snapshot)
-        # 限制undo栈深度
-        if len(self._eraser_undo_stack) > self._eraser_max_undo:
-            self._eraser_undo_stack.pop(0)
+        self._eraser_undo.push(alpha_snapshot)
 
     def eraser_undo(self):
         """撤销一笔橡皮擦"""
-        if not self._eraser_undo_stack:
+        alpha_snapshot = self._eraser_undo.pop()
+        if alpha_snapshot is None:
             return False
-        alpha_snapshot = self._eraser_undo_stack.pop()
+        # 当前 alpha 压入 redo
         arr = np.array(self.pil_img, dtype=np.uint8)
+        self._eraser_undo.push_redo(arr[:, :, 3].copy())
+        arr[:, :, 3] = alpha_snapshot
+        self.pil_img = Image.fromarray(arr, "RGBA")
+        self._render()
+        self._rebuild_margin_preview()
+        self.update()
+        return True
+
+    def eraser_redo(self):
+        """重做一笔橡皮擦"""
+        alpha_snapshot = self._eraser_undo.pop_redo()
+        if alpha_snapshot is None:
+            return False
+        # 当前 alpha 压回 undo（不清 redo）
+        arr = np.array(self.pil_img, dtype=np.uint8)
+        self._eraser_undo.push_undo_only(arr[:, :, 3].copy())
         arr[:, :, 3] = alpha_snapshot
         self.pil_img = Image.fromarray(arr, "RGBA")
         self._render()
@@ -770,7 +784,7 @@ class CropCanvas(QLabel):
         self._btn_confirm_rect = None
         self._btn_cancel_rect = None
         # 清空undo栈（烘焙后之前的undo无效）
-        self._eraser_undo_stack.clear()
+        self._eraser_undo.clear()
         self.rotation_changed.emit(0.0)
 
     # ── 滚轮缩放 ──
@@ -826,7 +840,7 @@ class CropCanvas(QLabel):
             self._btn_confirm_rect = None
             self._btn_cancel_rect = None
             self._view_fit_done = False  # 裁切后重新适配视图
-            self._eraser_undo_stack.clear()  # 裁切后undo栈失效
+            self._eraser_undo.clear()  # 裁切后undo栈失效
             self._render()
             self.rotation_changed.emit(0.0)  # 同步角度标签
             self.crop_applied.emit()
@@ -1642,10 +1656,13 @@ class CropDialog(QDialog):
 
     def keyPressEvent(self, event):
         """处理键盘快捷键"""
-        # Ctrl+Z：橡皮擦撤销
-        if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_Z:
+        # Ctrl+Z / Ctrl+Shift+Z：橡皮擦撤销/重做
+        if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
             if self._btn_eraser.isChecked():
-                self.canvas.eraser_undo()
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.canvas.eraser_redo()
+                else:
+                    self.canvas.eraser_undo()
                 event.accept()
                 return
         super().keyPressEvent(event)

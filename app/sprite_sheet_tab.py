@@ -7,6 +7,7 @@ from typing import List, Optional, Callable, Tuple, Set
 from PIL import Image
 
 from export_dir_mixin import ExportDirMixin
+from undo import UndoStack
 from theme import T
 
 from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression, Signal
@@ -684,7 +685,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.preview_index = 0
 
         self._syncing = False  # 防止 list<->sheet 互相触发
-        self._undo_stack: List[List[str]] = []  # 拖拽排序撤销栈（最多保留20步）
+        self._undo = UndoStack(max_len=20)  # 拖拽排序撤销栈
 
         # -------- 一键命名（精灵图页签，独立记忆） --------
         self.output_basename: Optional[str] = None
@@ -1373,24 +1374,39 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         finally:
             self._syncing = False
 
-    # ---------------- undo (Ctrl+Z) ----------------
+    # ---------------- undo (Ctrl+Z) / redo (Ctrl+Shift+Z) ----------------
     def _push_undo(self):
-        """将当前 paths 快照压入撤销栈（最多保留20步）"""
-        self._undo_stack.append(list(self.paths))
-        if len(self._undo_stack) > 20:
-            self._undo_stack.pop(0)
+        """将当前 paths 快照压入撤销栈"""
+        self._undo.push(list(self.paths))
 
     def _undo_reorder(self):
         """撤销上一次拖拽排序"""
-        if not self._undo_stack:
+        snap = self._undo.pop()
+        if snap is None:
             return
-        self.paths = self._undo_stack.pop()
+        # 当前态压入 redo
+        self._undo.push_redo(list(self.paths))
+        self.paths = snap
+        self._reload_frames_and_rebuild(keep_selection=False)
+        self._update_gif_preview()
+
+    def _redo_reorder(self):
+        """重做上一次撤销的拖拽排序"""
+        snap = self._undo.pop_redo()
+        if snap is None:
+            return
+        # 当前态压回 undo（不清 redo）
+        self._undo.push_undo_only(list(self.paths))
+        self.paths = snap
         self._reload_frames_and_rebuild(keep_selection=False)
         self._update_gif_preview()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
-            self._undo_reorder()
+            if event.modifiers() & Qt.ShiftModifier:
+                self._redo_reorder()
+            else:
+                self._undo_reorder()
             event.accept()
             return
         super().keyPressEvent(event)

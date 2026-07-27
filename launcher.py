@@ -28,6 +28,7 @@ _EXPECTED_APP_MODULES = (
     "Texture_tool_GUI_with_tabs.py",  # 主入口
     "dialogs.py",
     "export_dir_mixin.py",
+    "undo.py",
     "flowmap_tab.py",
     "growth_algorithms.py",
     "growth_gray_tab.py",

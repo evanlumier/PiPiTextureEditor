@@ -31,6 +31,7 @@ import numpy as np
 from PIL import Image
 
 from export_dir_mixin import ExportDirMixin
+from undo import UndoStack
 from theme import T
 
 from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QRegularExpression, QTimer, QThread, Signal
@@ -887,8 +888,7 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         self._thresh_timer.timeout.connect(self._gen_mask_from_luminance)
 
         # ── 手绘路径撤销历史 ──────────────────────────────────────────
-        self._seed_history: List[np.ndarray] = []             # seed_map 快照栈
-        self._MAX_HISTORY = 30                                 # 最多保留 30 步
+        self._seed_history = UndoStack(max_len=30)  # seed_map 快照栈
 
         self._build_ui()
         self._connect_signals()
@@ -2007,6 +2007,11 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         undo_sc.setContext(Qt.WidgetWithChildrenShortcut)
         undo_sc.activated.connect(self._undo_stroke)
 
+        # Ctrl+Shift+Z 重做手绘路径
+        redo_sc = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        redo_sc.setContext(Qt.WidgetWithChildrenShortcut)
+        redo_sc.activated.connect(self._redo_stroke)
+
         # 生成
         self.btn_generate_seq.clicked.connect(self._generate_from_sequence)
         self.btn_cancel_seq.clicked.connect(self._cancel_seq_generation)
@@ -3045,21 +3050,44 @@ class GrowthGrayTab(ExportDirMixin, QWidget):
         """将当前 seed_map 的副本压入撤销栈。"""
         if self.seed_map is None:
             return
-        self._seed_history.append(self.seed_map.copy())
-        if len(self._seed_history) > self._MAX_HISTORY:
-            self._seed_history.pop(0)
+        self._seed_history.push(self.seed_map.copy())
 
     def _undo_stroke(self):
         """Ctrl+Z：弹出上一步 seed_map 快照并恢复。"""
-        if not self._seed_history:
+        snap = self._seed_history.pop()
+        if snap is None:
             return
-        self.seed_map = self._seed_history.pop()
+        # 当前态压入 redo
+        self._seed_history.push_redo(self.seed_map.copy())
+        self.seed_map = snap
         # 同步 gray_map 预览（仅显示 seed 有效区域）
         if self.gray_map is not None:
             self.gray_map[:] = 0.0
             valid = self.seed_map >= 0
             self.gray_map[valid] = self.seed_map[valid]
         # 同步 base_gray_map / final_gray_map，确保生长预览使用最新数据
+        if self.base_gray_map is not None:
+            self.base_gray_map[:] = 0.0
+            valid = self.seed_map >= 0
+            self.base_gray_map[valid] = self.seed_map[valid]
+        if self.final_gray_map is not None:
+            self.final_gray_map[:] = 0.0
+            valid = self.seed_map >= 0
+            self.final_gray_map[valid] = self.seed_map[valid]
+        self._refresh_all_previews()
+
+    def _redo_stroke(self):
+        """Ctrl+Shift+Z：重做上一次撤销的手绘。"""
+        snap = self._seed_history.pop_redo()
+        if snap is None:
+            return
+        # 当前态压回 undo（不清 redo）
+        self._seed_history.push_undo_only(self.seed_map.copy())
+        self.seed_map = snap
+        if self.gray_map is not None:
+            self.gray_map[:] = 0.0
+            valid = self.seed_map >= 0
+            self.gray_map[valid] = self.seed_map[valid]
         if self.base_gray_map is not None:
             self.base_gray_map[:] = 0.0
             valid = self.seed_map >= 0
