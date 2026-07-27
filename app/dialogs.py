@@ -125,6 +125,8 @@ class CropCanvas(QLabel):
         self._eraser_undo = UndoStack(max_len=15)  # undo栈，存储Alpha通道快照
         self._eraser_brush_mask: Optional[np.ndarray] = None  # 预计算的笔刷mask
         self._eraser_mouse_pos: Optional[QPoint] = None  # 当前鼠标位置（用于绘制光标）
+        self._eraser_last_pos: Optional[QPoint] = None  # 上一次应用的屏幕坐标（用于插值）
+        self._eraser_alpha_buf: Optional[np.ndarray] = None  # 插值期间的 alpha 工作缓冲（避免循环内反复转换）
 
         # ── 留白预览相关 ──
         self._margin_top: int = 0
@@ -425,6 +427,7 @@ class CropCanvas(QLabel):
                 # 开始一笔擦除：保存当前Alpha通道快照
                 self._eraser_start_stroke()
                 self._eraser_drawing = True
+                self._eraser_last_pos = pos
                 self._eraser_apply_at(pos)
                 self.update()
 
@@ -576,7 +579,7 @@ class CropCanvas(QLabel):
         elif self._mode == self.MODE_ERASER:
             self._eraser_mouse_pos = pos
             if self._eraser_drawing and (event.buttons() & Qt.LeftButton):
-                self._eraser_apply_at(pos)
+                self._eraser_apply_stroke(pos)
             self.update()
 
         else:
@@ -620,6 +623,7 @@ class CropCanvas(QLabel):
         elif self._mode == self.MODE_ERASER:
             if self._eraser_drawing:
                 self._eraser_drawing = False
+                self._eraser_last_pos = None
                 # 笔画结束，刷新画布和留白预览
                 self._render()
                 self._rebuild_margin_preview()
@@ -747,6 +751,81 @@ class CropCanvas(QLabel):
         # 实时刷新画布显示
         self._render()
         self.update()
+
+    def _eraser_apply_stroke(self, pos: QPoint):
+        """在 _eraser_last_pos 与 pos 之间线性插值应用笔刷，保证连续性。
+        整条线段只取/回写一次 arr，循环结束统一 render。"""
+        last = self._eraser_last_pos
+        if last is None:
+            # 首点：走单点路径（含 render）
+            self._eraser_apply_at(pos)
+            self._eraser_last_pos = pos
+            return
+
+        img_last = self._screen_to_img_coords(last)
+        img_now = self._screen_to_img_coords(pos)
+        if img_last[0] is None or img_now[0] is None:
+            self._eraser_apply_at(pos)
+            self._eraser_last_pos = pos
+            return
+
+        # 一次性取 arr + alpha buf，供整条线段循环复用
+        arr = np.array(self.pil_img, dtype=np.uint8)
+        self._eraser_alpha_buf = arr[:, :, 3].astype(np.float32)
+
+        img_step = max(1, self._eraser_size // 2)
+        img_dx = img_now[0] - img_last[0]
+        img_dy = img_now[1] - img_last[1]
+        img_dist = math.hypot(img_dx, img_dy)
+        n = max(1, int(math.ceil(img_dist / img_step)))
+
+        for i in range(1, n + 1):
+            t = i / n
+            ix = int(round(img_last[0] + img_dx * t))
+            iy = int(round(img_last[1] + img_dy * t))
+            self._eraser_apply_at_img(ix, iy)
+
+        # 一次性回写 + render
+        arr[:, :, 3] = self._eraser_alpha_buf.clip(0, 255).astype(np.uint8)
+        self.pil_img = Image.fromarray(arr, "RGBA")
+        self._eraser_alpha_buf = None
+        self._render()
+        self.update()
+
+        self._eraser_last_pos = pos
+
+    def _eraser_apply_at_img(self, img_x: int, img_y: int):
+        """在图片像素坐标处直接应用橡皮擦（操作 self._eraser_alpha_buf，不碰 pil_img）。"""
+        if self._eraser_brush_mask is None or self._eraser_alpha_buf is None:
+            return
+
+        alpha = self._eraser_alpha_buf
+        h, w = alpha.shape[:2]
+        size = self._eraser_size
+        mask = self._eraser_brush_mask
+
+        bx_start = img_x - size
+        by_start = img_y - size
+        bx_end = img_x + size + 1
+        by_end = img_y + size + 1
+
+        mx_start = max(0, -bx_start)
+        my_start = max(0, -by_start)
+        mx_end = mask.shape[1] - max(0, bx_end - w)
+        my_end = mask.shape[0] - max(0, by_end - h)
+
+        ix_start = max(0, bx_start)
+        iy_start = max(0, by_start)
+        ix_end = min(w, bx_end)
+        iy_end = min(h, by_end)
+
+        if ix_start >= ix_end or iy_start >= iy_end:
+            return
+
+        region = alpha[iy_start:iy_end, ix_start:ix_end]
+        mask_region = mask[my_start:my_end, mx_start:mx_end]
+        region *= (1.0 - mask_region)
+        alpha[iy_start:iy_end, ix_start:ix_end] = region
 
     def _screen_to_img_coords(self, pos: QPoint):
         """屏幕坐标转换为图片像素坐标"""
