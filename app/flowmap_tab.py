@@ -1064,10 +1064,41 @@ class VectorResultWidget(QWidget):
         self._mode_dx    = True   # True=DirectX（翻转G），False=OpenGL
         self._cached_pix: Optional[QPixmap] = None
         self._cached_key  = None
+        self.on_normal_imported: Optional[callable] = None  # 拖拽导入回调
+        self.setAcceptDrops(True)
         self.setStyleSheet(
             f"background:{T.bg_surface}; border:1px solid {T.border_subtle}; border-radius:8px;"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    # ── 拖拽导入法线图 ──────────────────────────────────────────
+    def _reset_style(self):
+        self.setStyleSheet(
+            f"background:{T.bg_surface}; border:1px solid {T.border_subtle}; border-radius:8px;"
+        )
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self.setStyleSheet(
+                f"background:{T.bg_base}; border:2px dashed {T.accent}; border-radius:8px;"
+            )
+
+    def dragLeaveEvent(self, e):
+        self._reset_style()
+
+    def dropEvent(self, e):
+        self._reset_style()
+        urls = e.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            _SUPPORTED = {'.png', '.jpg', '.jpeg', '.tga', '.bmp', '.webp'}
+            if os.path.splitext(path)[1].lower() not in _SUPPORTED:
+                QMessageBox.information(self, "提示",
+                    "不支持的文件格式。\n支持格式：PNG、JPG、JPEG、TGA、BMP、WEBP")
+                return
+            if self.on_normal_imported:
+                self.on_normal_imported(path)
 
     def update_normal(self, nm: np.ndarray):
         self._normal_map = nm
@@ -1096,7 +1127,7 @@ class VectorResultWidget(QWidget):
 
         if self._normal_map is None:
             p.setPen(QColor(69, 71, 90))
-            p.drawText(self.rect(), Qt.AlignCenter, "法线结果\n绘制后此处显示")
+            p.drawText(self.rect(), Qt.AlignCenter, "法线结果\n绘制后此处显示\n或拖入法线图")
             p.end()
             return
 
@@ -1537,6 +1568,58 @@ class FlowMapTab(ExportDirMixin, QWidget):
     def _on_normal_updated(self, nm: np.ndarray):
         self.vector_result.update_normal(nm)
 
+    # ── 拖拽导入法线图 ──────────────────────────────────────────
+    def _import_normal_map(self, path: str):
+        """从文件导入法线图到画布（解码 packed RGB → float32 法线向量）。
+
+        解码逻辑与 UE4 接收法线一致：
+          - packed: r = x*0.5+0.5, g = y*0.5+0.5, b = z*0.5+0.5
+          - 解码: x = r/255*2-1, y = g/255*2-1, z = b/255*2-1
+          - DirectX 模式: G 通道需翻转回来
+          - 解码后归一化
+        """
+        try:
+            img = Image.open(path).convert("RGB")
+            w, h = img.size
+
+            # 解码 packed RGB → float32 法线向量
+            arr = np.array(img, dtype=np.float32) / 255.0 * 2.0 - 1.0  # [-1, 1]
+
+            # 缩放到画布尺寸（float 域 + 归一化）
+            cw, ch = self.canvas._cw, self.canvas._ch
+            if w != cw or h != ch:
+                arr = cv2.resize(arr, (cw, ch), interpolation=cv2.INTER_LINEAR)
+                length = np.sqrt(np.sum(arr ** 2, axis=2, keepdims=True))
+                length = np.maximum(length, 1e-6)
+                arr = arr / length
+
+            nm = arr  # HxWx3
+
+            # DirectX 模式：G 通道在导出时翻转过（255-G），导入时翻回来
+            if self.canvas.mode_dx:
+                nm[:, :, 1] = -nm[:, :, 1]
+
+            # 归一化确保向量长度为 1
+            length = np.sqrt(np.sum(nm ** 2, axis=2, keepdims=True))
+            length = np.maximum(length, 1e-6)
+            nm = nm / length
+
+            # 保存 undo 快照，写入 normal_map
+            self.canvas.push_undo()
+            self.canvas.normal_map = nm
+            self.canvas._flow_cache_dirty = True
+            self.canvas._normal_vis_dirty = True
+            self.canvas.update()
+
+            # 通知结果区更新
+            if self.canvas.on_normal_updated:
+                self.canvas.on_normal_updated(self.canvas.normal_map)
+
+            # 自动打开"显示全图"以便用户查看导入的法线图
+            self.chk_show_all.setChecked(True)
+        except Exception as ex:
+            QMessageBox.critical(self, "导入失败", f"加载法线图失败：\n{ex}")
+
     # ── Tab 可见性控制（节省 CPU：不可见时暂停流动动画）──────────────
     def showEvent(self, e):
         super().showEvent(e)
@@ -1569,6 +1652,7 @@ class FlowMapTab(ExportDirMixin, QWidget):
         self.chk_follow.toggled.connect(lambda v: setattr(self.canvas, "follow_stroke", v))
 
         self.chk_show_all.toggled.connect(self.vector_result.set_show_all)
+        self.vector_result.on_normal_imported = self._import_normal_map
 
         self.btn_clear.clicked.connect(self._clear_canvas)
         self.btn_apply_name.clicked.connect(self._apply_name)

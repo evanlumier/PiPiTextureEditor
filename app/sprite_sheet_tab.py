@@ -18,7 +18,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QMessageBox, QGroupBox, QComboBox, QSplitter,
-    QCheckBox, QSpinBox, QAbstractItemView, QLineEdit
+    QCheckBox, QSpinBox, QAbstractItemView, QLineEdit, QDialog, QDialogButtonBox,
+    QFormLayout
 )
 
 from tab_transfer import (
@@ -908,6 +909,41 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.sheet_label.installEventFilter(self)
         self.sheet_label._right_click_callback = self._on_sheet_right_click
 
+        # 给精灵图预览区加拖拽支持（接受外部文件 URL → 切割精灵图）
+        self.sheet_label.setAcceptDrops(True)
+        self.sheet_label._sheet_default_style = self.sheet_label.styleSheet()
+        self.sheet_label._sheet_hover_style = f"background:{T.bg_base}; border:2px dashed {T.accent}; border-radius:8px;"
+
+        def _sheet_drag_enter(e):
+            if e.mimeData().hasUrls():
+                e.acceptProposedAction()
+                self.sheet_label.setStyleSheet(self.sheet_label._sheet_hover_style)
+            else:
+                # 内部 cell 拖拽，走原生逻辑
+                SheetPreviewLabel.dragEnterEvent(self.sheet_label, e)
+
+        def _sheet_drag_leave(e):
+            self.sheet_label.setStyleSheet(self.sheet_label._sheet_default_style)
+            SheetPreviewLabel.dragLeaveEvent(self.sheet_label, e)
+
+        def _sheet_drop(e):
+            if e.mimeData().hasUrls():
+                self.sheet_label.setStyleSheet(self.sheet_label._sheet_default_style)
+                urls = e.mimeData().urls()
+                path = urls[0].toLocalFile()
+                if os.path.splitext(path)[1].lower() not in SUPPORTED_EXTS:
+                    QMessageBox.information(self, "提示",
+                        "不支持的文件格式。\n支持格式：PNG、JPG、JPEG、TGA、BMP、WEBP")
+                    return
+                self._import_sprite_sheet(path)
+                return
+            # 内部 cell 拖拽走原生逻辑
+            SheetPreviewLabel.dropEvent(self.sheet_label, e)
+
+        self.sheet_label.dragEnterEvent = _sheet_drag_enter
+        self.sheet_label.dragLeaveEvent = _sheet_drag_leave
+        self.sheet_label.dropEvent = _sheet_drop
+
 
         self.gif_title = QLabel("GIF预览")
         self.gif_title.setStyleSheet(f"font-weight:700; color:{T.accent}; padding:4px 2px;")
@@ -1120,6 +1156,111 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self._refresh_enabled()
         self._on_grid_mode_change()
 
+    # ---------------- 拖入精灵图切割 ----------------
+    def _import_sprite_sheet(self, path: str):
+        """拖入一张精灵图，按网格切割成帧，走正常帧流程。"""
+        try:
+            sheet = Image.open(path).convert("RGBA")
+        except Exception as ex:
+            QMessageBox.critical(self, "导入失败", f"读取图片失败：\n{ex}")
+            return
+
+        w, h = sheet.size
+        if w < 2 or h < 2:
+            QMessageBox.warning(self, "图片太小", "图片尺寸太小，无法切割。")
+            return
+
+        # 猜测初始 cols/rows：假设单帧接近正方形
+        guess_cols = max(1, round(w / h))
+        guess_rows = max(1, round(h * guess_cols / w))
+
+        # 弹切割对话框
+        dlg = QDialog(self)
+        dlg.setWindowTitle("切割精灵图")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+
+        info_label = QLabel(f"源图尺寸：{w}×{h}")
+        layout.addWidget(info_label)
+
+        form = QFormLayout()
+        spin_cols = QSpinBox()
+        spin_cols.setRange(1, 256)
+        spin_cols.setValue(guess_cols)
+        spin_rows = QSpinBox()
+        spin_rows.setRange(1, 256)
+        spin_rows.setValue(guess_rows)
+        form.addRow("列数：", spin_cols)
+        form.addRow("行数：", spin_rows)
+        layout.addLayout(form)
+
+        result_label = QLabel()
+        result_label.setStyleSheet(f"color:{T.text_disabled}; font-size:11px;")
+        layout.addWidget(result_label)
+
+        def update_info():
+            c = spin_cols.value()
+            r = spin_rows.value()
+            fw = w // c
+            fh = h // r
+            total = c * r
+            result_label.setText(
+                f"预计帧数：{total}    单帧尺寸：{fw}×{fh}"
+                + ("    ⚠️ 帧尺寸过小" if fw < 8 or fh < 8 else "")
+            )
+
+        spin_cols.valueChanged.connect(update_info)
+        spin_rows.valueChanged.connect(update_info)
+        update_info()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
+            Qt.Horizontal, dlg
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        cols = spin_cols.value()
+        rows = spin_rows.value()
+        frame_w = w // cols
+        frame_h = h // rows
+        if frame_w < 1 or frame_h < 1:
+            QMessageBox.warning(self, "无法切割", f"cols×rows={cols}×{rows} 太大，单帧尺寸不足1像素。")
+            return
+
+        # 切割成帧
+        frames = []
+        for row in range(rows):
+            for col in range(cols):
+                x = col * frame_w
+                y = row * frame_h
+                frame = sheet.crop((x, y, x + frame_w, y + frame_h))
+                frames.append(frame)
+
+        if not frames:
+            QMessageBox.warning(self, "切割失败", "未能切割出任何帧。")
+            return
+
+        # 清空现有数据，走正常帧流程
+        self.paths = []           # 切割模式没有源文件路径
+        self.frames_rgba = frames
+        self._rebuild_list_items()
+        self._rebuild_sheet()
+        self._start_preview()
+        self._refresh_enabled()
+
+        # 同步 cols/rows 到 spin（blockSignals 避免触发 _on_cols_changed）
+        self.spin_cols.blockSignals(True)
+        self.spin_rows.blockSignals(True)
+        self.spin_cols.setValue(cols)
+        self.spin_rows.setValue(rows)
+        self.spin_cols.blockSignals(False)
+        self.spin_rows.blockSignals(False)
+
     # ---------------- enabled ----------------
     def _refresh_enabled(self):
         has = len(self.frames_rgba) > 0
@@ -1320,7 +1461,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             self._reload_frames_and_rebuild(keep_selection=True)
         self._update_gif_preview()
 
-    def _rebuild_list_items(self, keep_selection: bool):
+    def _rebuild_list_items(self, keep_selection: bool = False):
         selected_paths: Set[str] = set()
         if keep_selection:
             selected_paths = {it.data(Qt.UserRole) for it in self.list_widget.selectedItems()}
