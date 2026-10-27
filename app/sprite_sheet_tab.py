@@ -2,6 +2,8 @@
 import os
 import re
 import math
+import itertools
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Callable, Tuple, Set
 
 from PIL import Image
@@ -10,16 +12,16 @@ from export_dir_mixin import ExportDirMixin
 from undo import UndoStack
 from theme import T
 
-from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression, Signal
+from PySide6.QtCore import Qt, QTimer, QPoint, QRect, QByteArray, QMimeData, QRegularExpression, Signal, QEvent
 from PySide6.QtGui import (
     QRegularExpressionValidator,
-    QPixmap, QImage, QPainter, QPen, QColor, QDrag, QFontMetrics
+    QPixmap, QImage, QPainter, QPen, QColor, QDrag, QFontMetrics, QPalette
 )
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QMessageBox, QGroupBox, QComboBox, QSplitter,
     QCheckBox, QSpinBox, QAbstractItemView, QLineEdit, QDialog, QDialogButtonBox,
-    QFormLayout
+    QFormLayout, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QApplication
 )
 
 from tab_transfer import (
@@ -30,6 +32,19 @@ SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".webp"}
 
 MIME_LIST_MULTI = "application/x-gui-texture-editor-list-multi"
 MIME_CELL_MULTI = "application/x-gui-texture-editor-cell-multi"
+
+_FRAME_UID = itertools.count(1)
+
+
+@dataclass(eq=False)  # eq=False：按对象身份比较，避免 PIL Image 逐像素比较
+class Frame:
+    """精灵图的一帧。图像、显示名、来源、显隐绑在同一条记录里，
+    排序/删除/撤销时整条搬移，不存在多个数组之间对不齐的问题。"""
+    image: Image.Image                 # 解码后的 RGBA 图（只在导入时解码一次）
+    name: str                          # 列表显示名：文件名，或切割帧的 "<源图名>_001"
+    path: Optional[str] = None         # 来源文件绝对路径；切割帧为 None
+    visible: bool = True               # 抽帧监测显隐：只影响预览，不影响导出
+    uid: int = field(default_factory=lambda: next(_FRAME_UID))  # 列表项身份标识（存在 UserRole）
 
 
 def pil_to_qpixmap(img: Image.Image) -> QPixmap:
@@ -338,6 +353,57 @@ class ReorderListWidget(QListWidget):
         self.model().layoutChanged.emit()
 
 
+class EyeToggleDelegate(QStyledItemDelegate):
+    """文件列表 delegate：每行右侧画"显隐眼睛"（用于抽帧监测）。
+
+    - 睁眼 = 可见；闭眼 = 隐藏（列表文字置灰 + 大图对应 cell 半透明 + GIF 预览跳过）
+    - 只负责绘制；点击命中/切换由 SpriteSheetTab.eventFilter 在 viewport 层处理
+      （必须先于列表的选中更新拿到鼠标事件，否则普通点击会先把多选收缩成单行）
+    - 状态查询通过回调注入，delegate 不持有数据
+    """
+    EYE_W = 28  # 行右侧预留的眼睛区宽度（px）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.is_visible: Callable[[int], bool] = lambda row: True
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        row = index.row()
+        visible = bool(self.is_visible(row)) if index.isValid() else True
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if not visible:
+            # 隐藏帧：文字置灰
+            opt.palette.setColor(QPalette.Text, QColor(110, 113, 135))
+            opt.palette.setColor(QPalette.HighlightedText, QColor(110, 113, 135))
+        # 文字区右缩，避免与眼睛重叠
+        opt.rect.adjust(0, 0, -self.EYE_W, 0)
+        QApplication.style().drawControl(QStyle.CE_ItemViewItem, opt, painter)
+
+        # ── 画眼睛（居中于右侧预留区）──
+        cx = option.rect.right() - self.EYE_W / 2
+        cy = option.rect.center().y()
+        color = QColor(166, 227, 161) if visible else QColor(108, 112, 134)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(color)
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        if visible:
+            # 睁眼：眼眶 + 瞳孔
+            painter.drawEllipse(QRect(int(cx - 8), int(cy - 5), 16, 10))
+            painter.setBrush(color)
+            painter.drawEllipse(QRect(int(cx - 2.5), int(cy - 2.5), 5, 5))
+        else:
+            # 闭眼：眼眶 + 横线
+            painter.drawEllipse(QRect(int(cx - 8), int(cy - 5), 16, 10))
+            painter.drawLine(QPoint(int(cx - 5), int(cy)), QPoint(int(cx + 5), int(cy)))
+        painter.restore()
+
+
 class SheetPreviewLabel(QLabel):
     """
     显示 SpriteSheet：
@@ -374,6 +440,9 @@ class SheetPreviewLabel(QLabel):
         self._drag_from: Optional[int] = None
         self._press_pos = QPoint()
 
+        # 隐藏帧索引集合（抽帧监测：对应 cell 画半透明蒙版）
+        self._hidden: Set[int] = set()
+
         # 插入落点（0..count），None 表示不显示
         self._drop_insert_index: Optional[int] = None
 
@@ -393,6 +462,12 @@ class SheetPreviewLabel(QLabel):
         if self._anchor is not None and not (0 <= self._anchor < self._count):
             self._anchor = None
         self._drop_insert_index = None
+        self._hidden = {i for i in self._hidden if 0 <= i < self._count}
+        self.update()
+
+    def set_hidden(self, hidden: Set[int]):
+        """更新隐藏帧集合（抽帧监测半透明蒙版），不重建 pixmap。"""
+        self._hidden = {i for i in hidden if 0 <= i < self._count}
         self.update()
 
     def set_selected_set(self, s: Set[int], anchor: Optional[int] = None):
@@ -519,6 +594,18 @@ class SheetPreviewLabel(QLabel):
                 x = rect.x() + int(col * cell_w)
                 y = rect.y() + int(row * cell_h)
                 p.drawRect(QRect(x, y, int(cell_w), int(cell_h)))
+
+            # 隐藏帧半透明蒙版（抽帧监测：不影响导出数据，纯预览层）
+            if self._hidden:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(13, 15, 25, 130))
+                for idx in sorted(self._hidden):
+                    if 0 <= idx < self._count:
+                        row = idx // self._cols
+                        col = idx % self._cols
+                        x = rect.x() + int(col * cell_w)
+                        y = rect.y() + int(row * cell_h)
+                        p.drawRect(QRect(x, y, int(cell_w) + 1, int(cell_h) + 1))
 
             # 多选高亮框（加粗）
             if self._selected:
@@ -673,8 +760,8 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.paths: List[str] = []
-        self.frames_rgba: List[Image.Image] = []
+        # 唯一的帧数据源：顺序即精灵图排布顺序
+        self.frames: List[Frame] = []
         self.sheet_rgba: Optional[Image.Image] = None
 
         self.sheet_cols = 1
@@ -870,6 +957,13 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         )
         self.list_widget.itemSelectionChanged.connect(self._on_list_selection_changed)
         self.list_widget.installEventFilter(self)
+
+        # 每行右侧"眼睛"显隐控件（抽帧监测）
+        self._eye_delegate = EyeToggleDelegate(self.list_widget)
+        self._eye_delegate.is_visible = self._row_visible
+        self.list_widget.setItemDelegate(self._eye_delegate)
+        # 眼睛点击在 viewport 事件过滤器里处理（先于列表选中更新，保证能读到多选集合）
+        self.list_widget.viewport().installEventFilter(self)
 
         # rowsMoved 对 Qt 内部 move 并不总触发，这里仍保留，但我们也在 selection/rebuild 时保持一致
         self.list_widget.model().rowsMoved.connect(lambda *args: self._on_list_reordered())
@@ -1232,26 +1326,30 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             QMessageBox.warning(self, "无法切割", f"cols×rows={cols}×{rows} 太大，单帧尺寸不足1像素。")
             return
 
-        # 切割成帧
-        frames = []
+        # 切割成帧（显示名：源图名_序号，切割帧没有磁盘文件 path=None）
+        stem = os.path.splitext(os.path.basename(path))[0]
+        digits = max(3, len(str(cols * rows)))
+        new_frames: List[Frame] = []
         for row in range(rows):
             for col in range(cols):
                 x = col * frame_w
                 y = row * frame_h
-                frame = sheet.crop((x, y, x + frame_w, y + frame_h))
-                frames.append(frame)
+                img = sheet.crop((x, y, x + frame_w, y + frame_h))
+                idx = len(new_frames) + 1
+                new_frames.append(Frame(image=img, name=f"{stem}_{idx:0{digits}d}"))
 
-        if not frames:
+        if not new_frames:
             QMessageBox.warning(self, "切割失败", "未能切割出任何帧。")
             return
 
-        # 清空现有数据，走正常帧流程
-        self._push_undo()  # 切割前压栈，Ctrl+Z 可恢复切割前的文件列表
-        self.paths = []           # 切割模式没有源文件路径
-        self.frames_rgba = frames
+        # 替换现有帧（切割前压栈，Ctrl+Z 可恢复切割前的帧列表）
+        self._push_undo()
+        self.timer.stop()
+        self.frames = new_frames
 
-        # 同步 cols/rows 到 spin（blockSignals 避免触发 _on_cols_changed）
-        # 注意：必须在 _rebuild_sheet 之前，手动模式 _rebuild_sheet 读取 spin 值排布
+        # 同步 cols/rows 到 spin：先按新帧数放开上限，否则 setValue 会被旧上限截断
+        # （blockSignals 避免触发 _on_cols_changed；必须在 _rebuild_sheet 之前，手动模式按 spin 值排布）
+        self._update_spin_ranges()
         self.spin_cols.blockSignals(True)
         self.spin_rows.blockSignals(True)
         self.spin_cols.setValue(cols)
@@ -1259,14 +1357,11 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.spin_cols.blockSignals(False)
         self.spin_rows.blockSignals(False)
 
-        self._rebuild_list_items()
-        self._rebuild_sheet()
-        self._start_preview()
-        self._refresh_enabled()
+        self._rebuild_all()
 
     # ---------------- enabled ----------------
     def _refresh_enabled(self):
-        has = len(self.frames_rgba) > 0
+        has = len(self.frames) > 0
         self.btn_clear.setEnabled(has)
         self.btn_export.setEnabled(has and self.sheet_rgba is not None)
         if hasattr(self, 'btn_refresh_gif'):
@@ -1292,7 +1387,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         MAX_FRAMES = 256  # 精灵图最大帧数上限，防止内存溢出
 
         uniq: List[str] = []
-        existed = set(self.paths)
+        existed = {f.path for f in self.frames if f.path}
         for p in new_paths:
             p = os.path.abspath(p)
             if p not in existed:
@@ -1303,18 +1398,19 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             return
 
         # 帧数上限检查
-        remaining = MAX_FRAMES - len(self.paths)
+        current = len(self.frames)
+        remaining = MAX_FRAMES - current
         if remaining <= 0:
             QMessageBox.warning(
                 self, "帧数已达上限",
-                f"精灵图最多支持 {MAX_FRAMES} 帧，当前已有 {len(self.paths)} 帧，无法继续添加。"
+                f"精灵图最多支持 {MAX_FRAMES} 帧，当前已有 {current} 帧，无法继续添加。"
             )
             return
         if len(uniq) > remaining:
             QMessageBox.warning(
                 self, "帧数超出上限",
                 f"精灵图最多支持 {MAX_FRAMES} 帧。\n"
-                f"当前已有 {len(self.paths)} 帧，本次尝试添加 {len(uniq)} 帧。\n"
+                f"当前已有 {current} 帧，本次尝试添加 {len(uniq)} 帧。\n"
                 f"将只导入前 {remaining} 张。"
             )
             uniq = uniq[:remaining]
@@ -1322,15 +1418,31 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         # 按文件名自然排序（支持 1,2,3...10,11 数字顺序）
         uniq.sort(key=self._natural_sort_key)
 
-        self.paths.extend(uniq)
+        # 只解码新文件（已有帧不重读磁盘）；读取失败的当场跳过
+        added: List[Frame] = []
+        bad: List[str] = []
+        for p in uniq:
+            try:
+                img = Image.open(p).convert("RGBA")
+            except Exception:
+                bad.append(p)
+                continue
+            added.append(Frame(image=img, name=os.path.basename(p), path=p))
+
+        if bad:
+            QMessageBox.warning(self, "部分文件读取失败", "以下文件无法读取，将被跳过：\n" + "\n".join(bad))
+        if not added:
+            return
+
+        self.timer.stop()
+        self.frames.extend(added)
         # 新增图片后重新计算最优行列并同步到 spin（不改变手动/自动模式）
         self._apply_auto_grid_to_spins()
-        self._reload_frames_and_rebuild()
+        self._rebuild_all()
 
     def clear_all(self):
         self.timer.stop()
-        self.paths = []
-        self.frames_rgba = []
+        self.frames = []
         self.sheet_rgba = None
         self.preview_index = 0
 
@@ -1395,13 +1507,31 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         if not hasattr(self, 'btn_delete'):
             return
         has_sel = bool(self.list_widget.selectedItems()) or bool(self.sheet_label.selected_set())
-        self.btn_delete.setEnabled(has_sel and bool(self.paths))
+        self.btn_delete.setEnabled(has_sel and bool(self.frames))
 
 
 
     # ---------------- key handling (Delete/Backspace) ----------------
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
+        # 眼睛点击：viewport 鼠标按下先于列表选中更新拦截。
+        # 必须在这一层处理——delegate 的 editorEvent 触发时，普通点击已把多选
+        # 收缩成单行，selectedItems() 读不到完整多选集合。
+        if obj is self.list_widget.viewport() and event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+                item = self.list_widget.itemAt(pos)
+                if item is not None:
+                    rect = self.list_widget.visualItemRect(item)
+                    eye_rect = QRect(
+                        rect.right() - EyeToggleDelegate.EYE_W,
+                        rect.top(),
+                        EyeToggleDelegate.EYE_W,
+                        rect.height(),
+                    )
+                    if eye_rect.contains(pos):
+                        self._toggle_frame_visible(self.list_widget.row(item))
+                        return True  # 吃掉：不改变列表选中，也不启动拖拽排序
         if event.type() == QEvent.KeyPress:
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
                 self.delete_selected()
@@ -1410,7 +1540,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
 
     def delete_selected(self):
         """删除当前选中的文件/cell（支持单选/多选），按 Delete/Backspace 或按钮触发。"""
-        if not self.paths:
+        if not self.frames:
             return
 
         # 优先取左侧列表选中；若没有则取右侧 sheet 选中
@@ -1418,14 +1548,14 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         if not sel_rows:
             sel_rows = self.sheet_label.selected_set()
 
-        sel_rows = {i for i in sel_rows if 0 <= i < len(self.paths)}
+        sel_rows = {i for i in sel_rows if 0 <= i < len(self.frames)}
         if not sel_rows:
             return
 
         # 确认弹窗
         count = len(sel_rows)
         if count == 1:
-            name = os.path.basename(self.paths[next(iter(sel_rows))])
+            name = self.frames[next(iter(sel_rows))].name
             msg = f"确认从列表中移除：\n{name}？"
         else:
             msg = f"确认从列表中移除选中的 {count} 张图片？"
@@ -1438,51 +1568,98 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
 
         # 删除
         self.timer.stop()
-        self.paths = [p for i, p in enumerate(self.paths) if i not in sel_rows]
+        self.frames = [f for i, f in enumerate(self.frames) if i not in sel_rows]
 
         # 清空选中状态
         self.sheet_label.set_selected_set(set())
 
-        if not self.paths:
+        if not self.frames:
             self.clear_all()
             return
 
         # 删除后重新计算最优行列并同步到 spin（不改变手动/自动模式）
         self._apply_auto_grid_to_spins()
-        self._reload_frames_and_rebuild(keep_selection=False)
-# ---------------- list reorder ----------------
+        self._rebuild_all(keep_selection=False)
+
+    # ---------------- list reorder ----------------
     def _on_list_reordered(self):
-        ordered: List[str] = []
+        # 列表项 UserRole 存的是 Frame.uid，按 uid 映射回帧对象即得新顺序
+        by_uid = {f.uid: f for f in self.frames}
+        ordered: List[Frame] = []
         for i in range(self.list_widget.count()):
-            it = self.list_widget.item(i)
-            p = it.data(Qt.UserRole)
-            if p:
-                ordered.append(p)
-        if ordered and ordered != self.paths:
+            f = by_uid.get(self.list_widget.item(i).data(Qt.UserRole))
+            if f is not None:
+                ordered.append(f)
+        if len(ordered) != len(self.frames):
+            return  # 列表与数据不一致（理论上不会发生），不做任何改动
+        if any(a is not b for a, b in zip(ordered, self.frames)):
             self._push_undo()  # 列表拖拽前压栈
-            self.paths = ordered
-            self._reload_frames_and_rebuild(keep_selection=True)
+            self.frames = ordered
+            self._rebuild_all(keep_selection=True)
+        self._update_gif_preview()
+
+    # ---------------- frame visibility（抽帧监测） ----------------
+    def _row_visible(self, row: int) -> bool:
+        """列表 delegate 查询：row 行是否可见（越界视为可见）。"""
+        if 0 <= row < len(self.frames):
+            return self.frames[row].visible
+        return True
+
+    def _hidden_set(self) -> Set[int]:
+        return {i for i, f in enumerate(self.frames) if not f.visible}
+
+    def _visible_indices(self) -> List[int]:
+        """GIF 预览用：可见帧的索引序列（跳过隐藏帧）。"""
+        return [i for i, f in enumerate(self.frames) if f.visible]
+
+    def _toggle_frame_visible(self, row: int):
+        """列表眼睛点击：切换帧显隐，刷新列表眼睛 + 大图蒙版 + GIF 预览。
+
+        批量适配 Shift/Ctrl 多选：点击行属于多选集合时，
+        目标状态（点击行翻转后的值）统一应用到所有选中行；
+        点击行不在选中集合（或仅单选）时只切该行。
+        """
+        if not (0 <= row < len(self.frames)):
+            return
+        target = not self.frames[row].visible
+
+        sel_rows = {self.list_widget.row(it) for it in self.list_widget.selectedItems()}
+        if len(sel_rows) > 1 and row in sel_rows:
+            rows = sorted(i for i in sel_rows if 0 <= i < len(self.frames))
+        else:
+            rows = [row]
+
+        for i in rows:
+            self.frames[i].visible = target
+
+        self.list_widget.viewport().update()
+        self.sheet_label.set_hidden(self._hidden_set())
+        # 有帧重新可见且 timer 停着（此前全部隐藏）时恢复 GIF 预览
+        if target and not self.timer.isActive() and self.frames:
+            self.timer.start()
         self._update_gif_preview()
 
     def _rebuild_list_items(self, keep_selection: bool = False):
-        selected_paths: Set[str] = set()
+        selected_uids: Set[int] = set()
         if keep_selection:
-            selected_paths = {it.data(Qt.UserRole) for it in self.list_widget.selectedItems()}
+            selected_uids = {it.data(Qt.UserRole) for it in self.list_widget.selectedItems()}
 
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        for p in self.paths:
-            it = QListWidgetItem(os.path.basename(p))
-            it.setData(Qt.UserRole, p)
+        for f in self.frames:
+            it = QListWidgetItem(f.name)
+            it.setData(Qt.UserRole, f.uid)
+            if f.path:
+                it.setToolTip(f.path)
             self.list_widget.addItem(it)
-            if keep_selection and p in selected_paths:
+            if keep_selection and f.uid in selected_uids:
                 it.setSelected(True)
         self.list_widget.blockSignals(False)
 
     # ---------------- sheet reorder (multi) ----------------
     def _reorder_by_cell_drag_multi(self, src_indices: List[int], insert_index: int):
         """在精灵图预览里拖拽排序：insert_index 是插入位置（0..n）"""
-        n = len(self.paths)
+        n = len(self.frames)
         src = sorted(set([i for i in src_indices if 0 <= i < n]))
         if not src:
             return
@@ -1494,15 +1671,16 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         if (min(src) < insert_index <= (max(src) + 1)):
             return
         self._push_undo()  # 精灵图拖拽前压栈
-        moving = [self.paths[i] for i in src]
-        remaining = [p for i, p in enumerate(self.paths) if i not in src]
+        src_set = set(src)
+        moving = [self.frames[i] for i in src]
+        remaining = [f for i, f in enumerate(self.frames) if i not in src_set]
 
         removed_before = sum(1 for i in src if i < insert_index)
         insert_at = insert_index - removed_before
         insert_at = max(0, min(len(remaining), insert_at))
 
-        self.paths = remaining[:insert_at] + moving + remaining[insert_at:]
-        self._reload_frames_and_rebuild(keep_selection=True)
+        self.frames = remaining[:insert_at] + moving + remaining[insert_at:]
+        self._rebuild_all(keep_selection=True)
         self._update_gif_preview()
 
         # 同步选中：移动后的 indices
@@ -1519,31 +1697,43 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             self._syncing = False
 
     # ---------------- undo (Ctrl+Z) / redo (Ctrl+Shift+Z) ----------------
+    def _snapshot(self) -> List[Frame]:
+        """当前帧列表快照：浅拷贝每条记录（visible 是可变字段，需与后续修改隔离），
+        图像对象共用不复制，开销只有几个指针。uid 保留，撤销后列表项身份不变。"""
+        return [replace(f) for f in self.frames]
+
     def _push_undo(self):
-        """将当前 paths 快照压入撤销栈"""
-        self._undo.push(list(self.paths))
+        """将当前帧列表快照压入撤销栈"""
+        self._undo.push(self._snapshot())
+
+    def _restore_snapshot(self, snap: List[Frame]):
+        """应用 undo/redo 快照：不读磁盘，直接用快照里的图像重建。"""
+        self.timer.stop()
+        self.frames = [replace(f) for f in snap]
+        self.sheet_label.set_selected_set(set())
+        if not self.frames:
+            self.clear_all()  # 例：空白状态切割导入后撤销 → 回到空白，需清掉大图/GIF 显示
+            return
+        self._update_spin_ranges()
+        self._rebuild_all(keep_selection=False)
 
     def _undo_reorder(self):
-        """撤销上一次拖拽排序"""
+        """撤销上一次帧列表修改（排序/切割导入）"""
         snap = self._undo.pop()
         if snap is None:
             return
         # 当前态压入 redo
-        self._undo.push_redo(list(self.paths))
-        self.paths = snap
-        self._reload_frames_and_rebuild(keep_selection=False)
-        self._update_gif_preview()
+        self._undo.push_redo(self._snapshot())
+        self._restore_snapshot(snap)
 
     def _redo_reorder(self):
-        """重做上一次撤销的拖拽排序"""
+        """重做上一次撤销的修改"""
         snap = self._undo.pop_redo()
         if snap is None:
             return
         # 当前态压回 undo（不清 redo）
-        self._undo.push_undo_only(list(self.paths))
-        self.paths = snap
-        self._reload_frames_and_rebuild(keep_selection=False)
-        self._update_gif_preview()
+        self._undo.push_undo_only(self._snapshot())
+        self._restore_snapshot(snap)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier):
@@ -1556,8 +1746,8 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         super().keyPressEvent(event)
 
     def _cell_name(self, idx: int) -> str:
-        if 0 <= idx < len(self.paths):
-            return os.path.basename(self.paths[idx])
+        if 0 <= idx < len(self.frames):
+            return self.frames[idx].name
         return ""
 
     # ---------------- grid mode ----------------
@@ -1567,7 +1757,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.spin_rows.setEnabled(manual)
         self.btn_reset_grid.setEnabled(manual)
 
-        if self.frames_rgba:
+        if self.frames:
             self._rebuild_sheet()
             self._start_preview()
             self._refresh_enabled()
@@ -1576,7 +1766,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         """列数变化：自动计算所需行数（ceil(n/cols)）"""
         if self.chk_auto_grid.isChecked():
             return
-        n = len(self.frames_rgba)
+        n = len(self.frames)
         if n > 0:
             cols = max(1, self.spin_cols.value())
             auto_rows = int(math.ceil(n / cols))
@@ -1591,7 +1781,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         """行数变化：自动计算所需列数（ceil(n/rows)）"""
         if self.chk_auto_grid.isChecked():
             return
-        n = len(self.frames_rgba)
+        n = len(self.frames)
         if n > 0:
             rows = max(1, self.spin_rows.value())
             auto_cols = int(math.ceil(n / rows))
@@ -1602,17 +1792,25 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             self._rebuild_sheet()
             self._start_preview()
 
+    def _update_spin_ranges(self):
+        """按当前帧数设置行列 spin 上限（列/行最多不超过帧数）。"""
+        n = max(1, len(self.frames))
+        self.spin_cols.blockSignals(True)
+        self.spin_rows.blockSignals(True)
+        self.spin_cols.setMaximum(n)
+        self.spin_rows.setMaximum(n)
+        self.spin_cols.blockSignals(False)
+        self.spin_rows.blockSignals(False)
+
     def _apply_auto_grid_to_spins(self):
-        """根据当前 paths 数量计算最优行列，直接写入 spin（不改变手动/自动模式）。"""
-        n = len(self.paths)
+        """根据当前帧数计算最优行列，直接写入 spin（不改变手动/自动模式）。"""
+        n = len(self.frames)
         if n <= 0:
             return
         cols, rows = self._compute_auto_grid(n)
+        self._update_spin_ranges()
         self.spin_cols.blockSignals(True)
         self.spin_rows.blockSignals(True)
-        # 限制最大值：列/行最多不超过图片总数
-        self.spin_cols.setMaximum(n)
-        self.spin_rows.setMaximum(n)
         self.spin_cols.setValue(cols)
         self.spin_rows.setValue(rows)
         self.spin_cols.blockSignals(False)
@@ -1622,23 +1820,12 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         self.chk_auto_grid.setChecked(True)
 
     # ---------------- build sheet ----------------
-    def _reload_frames_and_rebuild(self, keep_selection: bool = False):
+    def _rebuild_all(self, keep_selection: bool = False):
+        """帧列表变化后的统一刷新：列表项 → 精灵图 → GIF 预览 → 按钮状态。
+        只用内存里的 Frame.image，不读磁盘（解码只在 add_paths 导入时发生）。"""
         self._rebuild_list_items(keep_selection=keep_selection)
 
-        frames: List[Image.Image] = []
-        bad: List[str] = []
-        for p in self.paths:
-            try:
-                frames.append(Image.open(p).convert("RGBA"))
-            except Exception:
-                bad.append(p)
-
-        if bad:
-            QMessageBox.warning(self, "部分文件读取失败", "以下文件无法读取，将被跳过：\n" + "\n".join(bad))
-
-        self.frames_rgba = frames
-
-        if not self.frames_rgba:
+        if not self.frames:
             self.sheet_rgba = None
             self.timer.stop()
             self._refresh_enabled()
@@ -1686,7 +1873,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         return max(1, best_cols), max(1, best_rows)
 
     def _rebuild_sheet(self):
-        n = len(self.frames_rgba)
+        n = len(self.frames)
         if n <= 0:
             self.sheet_rgba = None
             return
@@ -1713,14 +1900,14 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
 
         self.sheet_cols, self.sheet_rows = cols, rows
 
-        max_w = max(im.size[0] for im in self.frames_rgba)
-        max_h = max(im.size[1] for im in self.frames_rgba)
+        max_w = max(f.image.size[0] for f in self.frames)
+        max_h = max(f.image.size[1] for f in self.frames)
         max_w = max(1, int(max_w))
         max_h = max(1, int(max_h))
 
         sheet = Image.new("RGBA", (cols * max_w, rows * max_h), (0, 0, 0, 0))
 
-        for idx, im in enumerate(self.frames_rgba):
+        for idx, im in enumerate(f.image for f in self.frames):
             r = idx // cols
             c = idx % cols
             x = c * max_w
@@ -1770,7 +1957,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         else:
             self.sheet_title.setText("精灵图预览")
 
-        if self.frames_rgba:
+        if self.frames:
             cols = max(1, self.sheet_cols)
             rows = max(1, self.sheet_rows)
             cell_w = out_w // cols
@@ -1788,14 +1975,16 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         out_w, out_h = self._get_export_size()
         preview_img = self.sheet_rgba.resize((out_w, out_h), resample=Image.LANCZOS)
         pix = pil_to_qpixmap(preview_img)
-        self.sheet_label.set_sheet(pix, self.sheet_cols, self.sheet_rows, len(self.frames_rgba))
+        self.sheet_label.set_sheet(pix, self.sheet_cols, self.sheet_rows, len(self.frames))
+        self.sheet_label.set_hidden(self._hidden_set())
         self._update_preview_titles()
 
     def _update_gif_preview(self):
-        if not self.frames_rgba:
+        vis = self._visible_indices()
+        if not vis:
             self.gif_label.clear()
             return
-        i = self.preview_index % len(self.frames_rgba)
+        i = vis[self.preview_index % len(vis)]
         # 根据导出尺寸计算每帧的实际像素大小
         out_w, out_h = self._get_export_size()
         cols = max(1, self.sheet_cols)
@@ -1803,7 +1992,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
         cell_w = max(1, out_w // cols)
         cell_h = max(1, out_h // rows)
         # 先将帧缩放到导出后的实际单帧尺寸，再缩放到预览区大小
-        frame_resized = self.frames_rgba[i].resize((cell_w, cell_h), resample=Image.LANCZOS)
+        frame_resized = self.frames[i].image.resize((cell_w, cell_h), resample=Image.LANCZOS)
         pix = pil_to_qpixmap(frame_resized).scaled(
             self.gif_label.width(),
             self.gif_label.height(),
@@ -1819,10 +2008,12 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             self.timer.start()
 
     def _tick_preview(self):
-        if not self.frames_rgba:
+        vis = self._visible_indices()
+        if not vis:
             self.timer.stop()
+            self.gif_label.clear()
             return
-        self.preview_index = (self.preview_index + 1) % len(self.frames_rgba)
+        self.preview_index = (self.preview_index + 1) % len(vis)
         self._update_gif_preview()
 
     def resizeEvent(self, event):
@@ -1834,7 +2025,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         # 仅在有帧数据且 timer 之前是活跃状态时恢复
-        if self.frames_rgba and getattr(self, '_timer_was_active', False):
+        if self.frames and getattr(self, '_timer_was_active', False):
             self.timer.start()
 
     def hideEvent(self, event):
@@ -1973,7 +2164,7 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
     def _on_sheet_right_click(self, global_pos):
         """精灵图预览区右键单击：弹出发送菜单（需要有选中帧）"""
         sel = self.sheet_label.selected_set()
-        if not sel or not self.frames_rgba:
+        if not sel or not self.frames:
             return
         menu = build_send_menu(self, TAB_SPRITE, self._send_selected_frame)
         menu.exec(global_pos)
@@ -1981,13 +2172,13 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
     def _send_selected_frame(self, target_tab: int):
         """将选中的第一帧发送到目标板块"""
         sel = sorted(self.sheet_label.selected_set())
-        if not sel or not self.frames_rgba:
+        if not sel or not self.frames:
             return
         # 取第一个选中帧
         idx = sel[0]
-        if idx >= len(self.frames_rgba):
+        if idx >= len(self.frames):
             return
-        pil_img = self.frames_rgba[idx]
+        pil_img = self.frames[idx].image
         tmp_path = pil_to_temp_png(pil_img, prefix="sprite_send_")
         if tmp_path:
             self.transfer_signal.emit(tmp_path, target_tab)
