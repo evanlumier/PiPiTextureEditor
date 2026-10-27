@@ -1246,20 +1246,23 @@ class SpriteSheetTab(ExportDirMixin, QWidget):
             return
 
         # 清空现有数据，走正常帧流程
+        self._push_undo()  # 切割前压栈，Ctrl+Z 可恢复切割前的文件列表
         self.paths = []           # 切割模式没有源文件路径
         self.frames_rgba = frames
-        self._rebuild_list_items()
-        self._rebuild_sheet()
-        self._start_preview()
-        self._refresh_enabled()
 
         # 同步 cols/rows 到 spin（blockSignals 避免触发 _on_cols_changed）
+        # 注意：必须在 _rebuild_sheet 之前，手动模式 _rebuild_sheet 读取 spin 值排布
         self.spin_cols.blockSignals(True)
         self.spin_rows.blockSignals(True)
         self.spin_cols.setValue(cols)
         self.spin_rows.setValue(rows)
         self.spin_cols.blockSignals(False)
         self.spin_rows.blockSignals(False)
+
+        self._rebuild_list_items()
+        self._rebuild_sheet()
+        self._start_preview()
+        self._refresh_enabled()
 
     # ---------------- enabled ----------------
     def _refresh_enabled(self):
