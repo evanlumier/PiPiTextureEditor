@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QStyleOptionTab,
     QStyle,
     QProgressDialog,
+    QSplitter,
 )
 
 
@@ -864,6 +865,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
 
         self.name_preview = QLabel("预览：-")
         self.name_preview.setStyleSheet("font-weight:700; color:#a6e3a1; padding:2px 0;")
+        self.name_preview.setWordWrap(True)  # 长文件名换行显示，不撑开窗口
 
         self.btn_apply_name = QPushButton("确定/应用命名")
         self.btn_apply_name.clicked.connect(self.apply_naming)
@@ -914,8 +916,22 @@ class MainWindow(ExportDirMixin, QMainWindow):
         right_layout.addWidget(self.info_label)
         right_layout.addStretch(1)
 
-        main_layout.addLayout(left_layout, 13)
-        main_layout.addLayout(right_layout, 12)
+        # 左右改为可拖动分割条（QSplitter）：拖动中间边界手动调整预览区/控件区宽度
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)  # 不允许把任一侧拖到完全消失
+        left_panel = QWidget()
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel.setLayout(left_layout)
+        right_panel = QWidget()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel.setLayout(right_layout)
+        right_panel.setMinimumWidth(380)  # 控件组最小宽度，防止拖得过窄
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)   # 窗口变大时多余空间优先给预览区
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([720, 440])     # 初始比例约 13:12
+        main_layout.addWidget(splitter)
 
         self.set_enabled(False)
 
