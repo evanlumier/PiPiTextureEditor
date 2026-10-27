@@ -1892,7 +1892,7 @@ class MainWindow(ExportDirMixin, QMainWindow):
 
     # ---------------- unmult ----------------
     def apply_unmult(self):
-        """去除黑底（Unmult）：根据 Alpha 通道反推原始颜色，消除预乘黑底"""
+        """去除黑底（Unmult）：alpha=原alpha×max(RGB)，同时反预乘恢复原色（Knoll UnMult 精确复刻）"""
         if self.master_color is None:
             return
         self.has_unmult = True
@@ -2096,17 +2096,25 @@ class MainWindow(ExportDirMixin, QMainWindow):
             base = to_bw_rgba(base)
 
         if self.has_unmult:
-            # Unmult（去除黑底）：Alpha = min(原始Alpha, max(R, G, B))
-            # 原理：纯黑(0,0,0)→透明，亮色→不透明，与 AE Unmult 插件一致
-            # 使用 min() 确保不会覆盖已有的透明度（如羽化渐变）
+            # Unmult（去除黑底）：Knoll UnMult 插件（UnMult_64.aex）逆向还原的精确算法
+            #   m = max(R, G, B)
+            #   A' = (A * m) / 256                （与已有 alpha 相乘，不是取 min）
+            #   m > 0:  R' = min(255, R*256 / m)  （反预乘：颜色恢复到全亮度）
+            #   m = 0:  R' = G' = B' = 0          （纯黑 → 全透明）
+            # 关键：除了生成 alpha，还把 RGB 除以 m（反预乘），
+            # 边缘半透明像素恢复原色，叠加时不再残留黑边/黑晕。
+            # 8 位路径整点运算与插件 LUT 逐值一致（含 A=255,m=255 → 254 的原版特性）。
             import numpy as np
             arr = np.array(base, dtype=np.uint8)
             rgb = arr[:, :, :3]
             original_alpha = arr[:, :, 3]
-            unmult_alpha = np.max(rgb, axis=2)  # max(R, G, B) 作为 unmult alpha
-            # 取两者较小值：保留羽化等已有透明度，同时去除黑底
-            new_alpha = np.minimum(original_alpha, unmult_alpha)
-            result = np.dstack([rgb, new_alpha])
+            m = rgb.max(axis=2).astype(np.uint32)          # 0..255
+            mm = np.maximum(m, 1)                          # 防除零；m=0 时 RGB 必为 0，结果不受影响
+            # 反预乘：R' = min(255, (R*256) // m)
+            new_rgb = np.minimum((rgb.astype(np.uint32) * 256) // mm[..., None], 255).astype(np.uint8)
+            # Alpha' = (A*m) >> 8，与插件 imul+sar 完全一致
+            new_alpha = ((original_alpha.astype(np.uint32) * m) >> 8).astype(np.uint8)
+            result = np.dstack([new_rgb, new_alpha])
             base = Image.fromarray(result, "RGBA")
 
         if self.target_size is not None:
