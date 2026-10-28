@@ -12,7 +12,11 @@ __min_compatible_version__: 从该版本起可与本版本安全走增量更新�
 __version__ = "0.8.10"
 
 # —— 更新协议元数据（v0.8.10 加固版起启用） ——
-# 修改准则：只要 RELEASE.md 阶段 1.5「架构变更红线检查表」有任一项为"是"，
-# 就必须把 __update_protocol__ 递增，并同步刷新 __min_compatible_version__。
+# 这两个字段是“强制用户下完整包”的开关，与 __version__ 相互独立，日常发版保持不变。
+# 修改准则：只有当本次变更无法靠在线更新（整包替换 app/）完成、必须让用户重新下载完整安装包时
+# （例如 _internal/ 依赖大版本升级、目录结构调整、exe 变更），才把 __update_protocol__ 递增，
+# 并把 __min_compatible_version__ 设为本次版本号。
+# 仅新增/删除 app/*.py 不需要改：在线更新是整包替换，新文件会随 zip 一起装上。
+# 注意：一旦递增，所有低于新兼容底的用户都无法在线更新，只能手动下载完整包。
 __update_protocol__ = 2
 __min_compatible_version__ = "0.8.10"
