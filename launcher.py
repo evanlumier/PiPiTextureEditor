@@ -26,6 +26,8 @@ _EXPECTED_EXE_NAME = "皮皮贴图修改器.exe"
 # 避免半损坏状态下让用户看到 Python traceback。
 _EXPECTED_APP_MODULES = (
     "Texture_tool_GUI_with_tabs.py",  # 主入口
+    "atlas_split_core.py",
+    "atlas_split_tab.py",
     "dialogs.py",
     "export_dir_mixin.py",
     "undo.py",

@@ -61,6 +61,7 @@ from sprite_sheet_tab import SpriteSheetTab
 from flowmap_tab import FlowMapTab
 from growth_gray_tab import GrowthGrayTab
 from image_viewer_tab import ImageViewerTab
+from atlas_split_tab import AtlasSplitTab
 from tab_transfer import (
     TAB_TEXTURE, TAB_SPRITE, TAB_FLOWMAP, TAB_GRAYGROWTH, TAB_VIEWER,
     TAB_NAMES, TAB_HINTS, build_send_menu, pil_to_temp_png, qpixmap_to_pil,
@@ -616,17 +617,22 @@ class MainWindow(ExportDirMixin, QMainWindow):
         growth_tab = GrowthGrayTab()
         # Tab 5: 全能看图
         image_viewer_tab = ImageViewerTab()
+        # Tab 6: 图集拆分（T3D + 图集 → 单张 Sprite PNG）
+        # 放在最后；_get_current_ue4_tab 按序号判断，导入UE4 走该板块自己的批量接口
+        atlas_split_tab = AtlasSplitTab()
         tabs.addTab(root, "贴\n图\n修\n改")
         tabs.addTab(sprite_tab, "精\n灵\n图\n制\n作")
         tabs.addTab(flowmap_tab, "法\n线\n绘\n制")
         tabs.addTab(growth_tab, "灰\n度\n图\n生\n成")
         tabs.addTab(image_viewer_tab, "全\n能\n看\n图")
+        tabs.addTab(atlas_split_tab, "图\n集\n拆\n分")
 
         # 保存各 tab 引用，供 UE4 联动接口使用
         self._sprite_tab = sprite_tab
         self._flowmap_tab = flowmap_tab
         self._growth_tab = growth_tab
         self._image_viewer_tab = image_viewer_tab
+        self._atlas_split_tab = atlas_split_tab
 
         # 连接全能看图的「转移至贴图修改」信号（保留兼容）
         image_viewer_tab.transfer_to_texture.connect(self._on_transfer_from_viewer)
@@ -2418,8 +2424,47 @@ class MainWindow(ExportDirMixin, QMainWindow):
             return self._flowmap_tab
         elif idx == 3:
             return self._growth_tab
+        elif idx == 5:
+            return self._atlas_split_tab  # 图集拆分：批量导入，走 export_to_ue4_batch
         else:
             return None  # 全能看图 tab，不支持
+
+    def _export_atlas_split_to_ue4(self, tab_obj):
+        """图集拆分板块：批量导入。路径检查、UE4 就绪检查同单张流程，其余交给板块（结果写板块日志）"""
+        current_tab_idx = self._tabs.currentIndex()
+        target_path = self.ue4_target_path.text().strip().rstrip("/")
+        if not target_path:
+            QMessageBox.warning(self, "提示", "请填写 UE4 目标路径（如 /Game/Art/UI/Textures）")
+            return
+        if not target_path.startswith("/Game"):
+            QMessageBox.warning(self, "提示", "UE4 路径必须以 /Game 开头")
+            return
+
+        self._ue4_target_path_per_tab[current_tab_idx] = target_path
+        self._save_ue4_target_path(current_tab_idx, target_path)
+
+        sync_mgr = get_sync_manager()
+        if not sync_mgr.is_running():
+            sync_mgr.start()
+        if not sync_mgr.is_ue4_available():
+            QMessageBox.warning(
+                self, "UE4 未就绪",
+                "无法找到 UE4 Sync 目录。\n"
+                "请确认：\n"
+                "1. UE4 编辑器已启动\n"
+                "2. AssetWorkflowToolkit 插件已加载\n"
+                "3. 皮皮联动功能已启用"
+            )
+            return
+
+        self.btn_export_ue4.setEnabled(False)
+        self.btn_export_ue4.setText("正在导入...")
+        QApplication.processEvents()
+        try:
+            tab_obj.export_to_ue4_batch(target_path, sync_mgr)
+        finally:
+            self.btn_export_ue4.setEnabled(True)
+            self.btn_export_ue4.setText("导入UE4")
 
     def export_to_ue4(self):
         """将当前 tab 的图片导入到 UE4（所有 tab 共享此方法）"""
@@ -2427,6 +2472,10 @@ class MainWindow(ExportDirMixin, QMainWindow):
         tab_obj = self._get_current_ue4_tab()
         if tab_obj is None:
             QMessageBox.warning(self, "提示", "当前页签不支持导入 UE4")
+            return
+
+        if hasattr(tab_obj, "export_to_ue4_batch"):
+            self._export_atlas_split_to_ue4(tab_obj)
             return
 
         # 获取可导出图片

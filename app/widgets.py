@@ -341,6 +341,10 @@ class CheckerLabel(QWidget):
                 self._fit_to_view()
 
     # ── 绘制 ──────────────────────────────────────────────────────────
+    def _draw_image(self, p: QPainter, pix_rect: QRectF, pm: QPixmap):
+        """绘制图片本体。子类可覆盖以叠加效果（如图集拆分板块的区域高亮）。"""
+        p.drawPixmap(pix_rect, pm, QRectF(0, 0, pm.width(), pm.height()))
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -366,7 +370,7 @@ class CheckerLabel(QWidget):
         if has_image:
             pix_rect = self._pixmap_rect()
             if pix_rect:
-                p.drawPixmap(pix_rect, pm, QRectF(0, 0, pm.width(), pm.height()))
+                self._draw_image(p, pix_rect, pm)
 
         # 没有图片时显示拖拽提示
         if not has_image and self._on_drop_callback is not None:
